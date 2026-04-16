@@ -1,5 +1,3 @@
-# Run:    PYTHONHASHSEED=0 python -m graph_gen_deterministic
-
 import networkx as nx
 import json
 import shutil
@@ -25,6 +23,16 @@ PRAGMA_POSITION = {
     'ARRAY_PARTITION': 2
 }
 
+ARRAY_SCOPE_NODE_TYPE = 104
+ARRAY_SCOPE_TEXT = "array_scope"    # equivalent of icmp node for loop pragmas in array pragmas
+
+# New edge flow for array-scope <-> array declaration/use nodes
+ARRAY_SCOPE_EDGE_FLOW = 7
+
+# Keep array scope compact and informative
+ARRAY_SCOPE_MAX_TARGETS = 8
+ARRAY_SCOPE_MAX_PER_BLOCK = 2
+
 type_graph = 'harp'
 processed_gexf_folder = join(get_root_path(), f'{type_graph}/processed')
 
@@ -34,7 +42,7 @@ class Node():
         self.block : int = block
         self.function : int = function
         self.text : str = text
-        self.type_n : int = type_n ## 0: instruction, 1: variable, 2: immediate, 100: pragma, 4: pseudo node for block
+        self.type_n : int = type_n ## 0: instruction, 1: variable, 2: immediate, 4: pseudo block, 100: pragma, 104: array scope
         self.features : str = features ## contains full text
 
     def get_attr(self, after_process = True):
@@ -72,7 +80,6 @@ class Edge():
 
 
 
-
 def _node_sort_key(node, data):
     # Use only fields that exist in your graphs and are stable.
     # Adjust this to your schema.
@@ -85,88 +92,25 @@ def _node_sort_key(node, data):
         str(node),  # tie-breaker
     )
 
-def canonicalize_for_gexf(G: nx.MultiDiGraph) -> nx.MultiDiGraph:
-    """
-    Rebuild a graph with deterministic insertion order for nodes and edges.
-    Does NOT change node IDs; it only stabilizes serialization order and
-    any subsequent iteration-dependent numbering you do.
-    """
-    H = nx.MultiDiGraph()
-
-    # Deterministic node insertion order
-    nodes_sorted = sorted(G.nodes(data=True), key=lambda nd: _node_sort_key(nd[0], nd[1]))
-    for n, d in nodes_sorted:
-        H.add_node(n, **deepcopy(d))
-
-    node_rank = {n: i for i, (n, _) in enumerate(nodes_sorted)}
-
-    # Deterministic edge insertion order
-    edges = []
-    for u, v, k, d in G.edges(keys=True, data=True):
-        edges.append((u, v, k, deepcopy(d)))
-
-    def edge_sort_key(e):
-        u, v, k, d = e
-        return (
-            node_rank.get(u, 10**9),
-            node_rank.get(v, 10**9),
-            int(d.get("flow", -1)),
-            int(d.get("position", -1)),
-            str(u), str(v), str(k),
-        )
-
-    for u, v, k, d in sorted(edges, key=edge_sort_key):
-        H.add_edge(u, v, key=k, **d)
-
-    return H
-
-
-
-def assign_deterministic_edge_ids(G: nx.MultiDiGraph) -> None:
-    edges = list(G.edges(keys=True, data=True))
-
-    def ek(e):
-        u, v, k, d = e
-        return (
-            str(u), str(v), str(k),
-            int(d.get("flow", -1)),
-            int(d.get("position", -1)),
-        )
-
-    for eid, (u, v, k, d) in enumerate(sorted(edges, key=ek)):
-        d["id"] = eid
-
-
 
 def create_pseudo_node_block(block, function):
     return Node(block, function, text = 'pseudo_block', type_n = 4, features = 'auxiliary node for each block')
+
+def create_array_scope_node(block, function, varname, pragma_line):
+    feat = f"array_scope<{varname}> from pragma: {pragma_line}"
+    return Node(
+        block=block,
+        function=function,
+        text=ARRAY_SCOPE_TEXT,
+        type_n=ARRAY_SCOPE_NODE_TYPE,
+        features=feat,
+    )
 
 def add_to_graph(g_nx, nodes, edges):
     if len(nodes) > 0:
         g_nx.add_nodes_from(nodes)
     if len(edges) > 0:
         g_nx.add_edges_from(edges)
-
-
-def read_json_graph(name, readable=True):
-    '''
-        reads a graph in json format as a netwrokx graph
-
-        args:
-            name: name of the json file/ kernel's name
-            reaable: whether to store a readable format of the json file
-
-        returns:
-            g_nx: graph in networkx format
-    '''
-    filename = name + '.json'
-    with open(filename) as f:
-        js_graph=json.load(f)
-    g_nx=nx.readwrite.json_graph.node_link_graph(js_graph, edges="links")
-    if readable:
-        make_json_readable(name, js_graph)
-
-    return g_nx
 
 
 def llvm_to_nx(name):
@@ -186,23 +130,6 @@ def llvm_to_nx(name):
         g_nx=programl.to_networkx(G)
 
     return g_nx
-
-def make_json_readable(name, js_graph):
-    '''
-        gets a json file and beautifies it to make it readable
-
-        args:
-            name: kernel name
-            js_graph: the graph in networkx format read from the json file
-
-        writes:
-            a readable json file with name {name}_pretty.json
-    '''
-    filename = name + '_pretty.json'
-    f_json=open((filename), "w+")
-    json.dump(js_graph, f_json, indent=4, sort_keys=True)
-    f_json.close()
-
 
 
 def extract_function_names(c_code):
@@ -420,33 +347,34 @@ def get_pragmas_loops(path, name, EXT='cpp', top_func=None, log=False):
     return sorted_final_dict, for_count_source
 
 
-
-
 def get_pragmas_arrays(placeholder_cpp_file, log=False):
     """
-    Parse *_placeholders.cpp and collect all
+    Parse *_placeholders.c/.cpp and collect all
     `#pragma HLS array_partition` pragmas.
 
     Returns a list of dicts:
-        { "function": <function name or None>,
+        {
+          "function": <source function name or None>,
           "var": <array variable name>,
-          "pragma": <full pragma line> }
+          "pragma": <full pragma line>,
+          "type": <partition type or None>,
+          "factor": <factor token or None>,
+          "dim": <dim token or None>,
+        }
     """
     with open(placeholder_cpp_file, 'r') as f:
         lines = f.readlines()
 
-    # Build function spans: (name, start_line_idx, end_line_idx)
     function_names_list = extract_function_names(''.join(lines))
     func_spans = []
     for i, (fname, start_line) in enumerate(function_names_list):
-        start_idx = start_line - 1          # 0-based line index
+        start_idx = start_line - 1
         if i + 1 < len(function_names_list):
             end_idx = function_names_list[i + 1][1] - 2
         else:
             end_idx = len(lines) - 1
         func_spans.append((fname, start_idx, end_idx))
 
-    # Map line index --> function name
     line_to_func = {}
     for fname, s, e in func_spans:
         for li in range(s, e + 1):
@@ -455,23 +383,35 @@ def get_pragmas_arrays(placeholder_cpp_file, log=False):
     array_pragmas = []
     for idx, line in enumerate(lines):
         s = line.strip()
-        if not s.startswith("#pragma"):
+        s_low = s.lower()
+
+        if not s_low.startswith("#pragma"):
             continue
-        if "array_partition" not in s:
+        if "array_partition" not in s_low:
             continue
 
-        m = re.search(r'variable\s*=\s*([A-Za-z_]\w*)', s)
-        if not m:
+        m_var = re.search(r'\bvariable\s*=\s*([A-Za-z_]\w*)\b', s, flags=re.IGNORECASE)
+        if not m_var:
             continue
-        varname = m.group(1)
-        fname = line_to_func.get(idx, None)
-        array_pragmas.append(
-            {"function": fname, "var": varname, "pragma": s}
-        )
+
+        m_type   = re.search(r'\btype\s*=\s*([A-Za-z_]\w*)\b',   s, flags=re.IGNORECASE)
+        m_factor = re.search(r'\bfactor\s*=\s*([^\s]+)',         s, flags=re.IGNORECASE)
+        m_dim    = re.search(r'\bdim\s*=\s*([^\s]+)',            s, flags=re.IGNORECASE)
+
+        array_pragmas.append({
+            "function": line_to_func.get(idx, None),
+            "var": m_var.group(1),
+            "pragma": s,
+            "type":   m_type.group(1) if m_type else None,
+            "factor": m_factor.group(1) if m_factor else None,
+            "dim":    m_dim.group(1) if m_dim else None,
+        })
 
     if log:
         pprint(array_pragmas)
+
     return array_pragmas
+
 
 
 LABEL_IN_COMMENT = re.compile(r'/\*\s*(L\d+)\s*:\s*\*/', re.IGNORECASE)
@@ -571,9 +511,28 @@ def check_tripcount_consistency(for_loop_text, icmp_inst, tripcounts_by_label):
     return label
 
 
+def _get_node_full_text(ndata):
+    if "full_text" in ndata and ndata["full_text"] is not None:
+        return str(ndata["full_text"])
+
+    if "features" in ndata:
+        feat = ndata["features"]
+        try:
+            if isinstance(feat, str):
+                feat = ast.literal_eval(feat)
+            if isinstance(feat, dict):
+                ft = feat.get("full_text", [None])[0]
+                if ft is not None:
+                    return str(ft)
+        except Exception:
+            pass
+
+    return None
+
+
 def _parse_llvm_function_bodies(kernel_info_file: str):
     """
-    Return { llvm_define_line : [instruction_texts_without_labels] }.
+    Infer which numeric graph function-id corresponds to a given LLVM function definition string.
     """
     src_dir = os.path.dirname(kernel_info_file)
     kernel_name = os.path.basename(src_dir)
@@ -601,7 +560,7 @@ def _parse_llvm_function_bodies(kernel_info_file: str):
             if not s or s.startswith(";"):
                 continue
 
-            # skip basic block labels like "for.cond:"
+            # skip basic-block labels like "for.cond:" / "entry:"
             if re.match(r'^[A-Za-z0-9_.]+:\s*$', s):
                 continue
 
@@ -612,8 +571,8 @@ def _parse_llvm_function_bodies(kernel_info_file: str):
 
 def infer_graph_function_id(g_nx, llvm_key: str, llvm_func_bodies: dict):
     """
-    Infer which numeric graph function id corresponds to llvm_key by voting over
-    instruction-text matches across the graph.
+    Infer which numeric graph function-id corresponds to llvm_key by voting over
+    exact instruction-text matches.
     """
     counts = Counter()
 
@@ -621,16 +580,7 @@ def infer_graph_function_id(g_nx, llvm_key: str, llvm_func_bodies: dict):
         matched_func_ids = set()
 
         for _, ndata in g_nx.nodes(data=True):
-            full_text = None
-            if "features" in ndata:
-                try:
-                    feat = ast.literal_eval(str(ndata["features"]))
-                    full_text = feat.get("full_text", [None])[0]
-                except Exception:
-                    pass
-            elif "full_text" in ndata:
-                full_text = ndata["full_text"]
-
+            full_text = _get_node_full_text(ndata)
             if not isinstance(full_text, str):
                 continue
 
@@ -640,7 +590,6 @@ def infer_graph_function_id(g_nx, llvm_key: str, llvm_func_bodies: dict):
                 if fid != -1:
                     matched_func_ids.add(fid)
 
-        # If an instruction text maps uniquely to one graph function, make it count strongly
         if len(matched_func_ids) == 1:
             counts[next(iter(matched_func_ids))] += 5
         else:
@@ -654,34 +603,297 @@ def infer_graph_function_id(g_nx, llvm_key: str, llvm_func_bodies: dict):
     return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
 
 
+def _compile_var_token_regexes(varname: str):
+    """
+    Conservative LLVM-aware token regexes.
+    We intentionally support: %A, @A, A but reject accidental substring matches (A does not match AA)
+    """
+    ident_chars = r'A-Za-z0-9_.$'
+    v = re.escape(varname)
+
+    return [
+        re.compile(rf'(?<![{ident_chars}])%{v}(?![{ident_chars}])'),
+        re.compile(rf'(?<![{ident_chars}])@{v}(?![{ident_chars}])'),
+        re.compile(rf'(?<![{ident_chars}]){v}(?![{ident_chars}])'),
+    ]
+
+
+def _node_mentions_var(full_text: str, var_regexes) -> bool:
+    if not isinstance(full_text, str):
+        return False
+    return any(rx.search(full_text) for rx in var_regexes)
+
+
+def _is_array_decl_candidate(full_text: str, varname: str) -> bool:
+    """
+    Prefer exact LLVM allocation sites such as:
+        %A = alloca [1024 x i32], ...
+    """
+    if not isinstance(full_text, str):
+        return False
+
+    ident_chars = r'A-Za-z0-9_.$'
+    v = re.escape(varname)
+    decl_re = re.compile(rf'(?<![{ident_chars}])%{v}\s*=\s*alloca\b')
+    return decl_re.search(full_text) is not None
+
+
+def _array_target_priority(node, ndata):
+    """
+    Lower tuple = better representative target for array scope.
+    Prefer declaration/access-related nodes over generic mentions.
+    """
+    ft = _get_node_full_text(ndata)
+    ft = "" if ft is None else ft.split('!dbg')[0].strip()
+
+    if "getelementptr" in ft:
+        kind_rank = 0
+    elif re.search(r'\b(load|store)\b', ft):
+        kind_rank = 1
+    elif "call" in ft:
+        kind_rank = 2
+    elif int(ndata.get("type", -1)) == 1:
+        kind_rank = 3
+    else:
+        kind_rank = 4
+
+    return (
+        kind_rank,
+        int(ndata.get("block", -1)),
+        int(ndata.get("type", -1)),
+        str(ndata.get("text", "")),
+        ft,
+        str(node),
+    )
+
+
+def _is_immediate_node(ndata):
+    return int(ndata.get("type", -1)) == 2
+
+def _is_call_target(ndata):
+    ft = _get_node_full_text(ndata)
+    if not isinstance(ft, str):
+        return False
+    ft = ft.split('!dbg')[0].strip()
+    return "call" in ft
+
+
+def _call_callee_name(ndata):
+    ft = _get_node_full_text(ndata)
+    if not isinstance(ft, str):
+        return ""
+    ft = ft.split('!dbg')[0].strip()
+    m = re.search(r'\bcall\b.*?@([^(]+)\(', ft)
+    return m.group(1) if m else ft
+
+
+def _iter_same_func_flow_neighbors(
+    g_nx,
+    node,
+    expected_graph_func_id,
+    allowed_flows=(1,),
+    skip_types=(2,),
+):
+    seen = set()
+
+    for u, _, _, ed in g_nx.in_edges(node, keys=True, data=True):
+        if int(ed.get("flow", -1)) not in allowed_flows:
+            continue
+        nd = g_nx.nodes[u]
+        if int(nd.get("function", -1)) != int(expected_graph_func_id):
+            continue
+        if int(nd.get("type", -1)) in skip_types:
+            continue
+        if u not in seen:
+            seen.add(u)
+            yield u, nd
+
+    for _, v, _, ed in g_nx.out_edges(node, keys=True, data=True):
+        if int(ed.get("flow", -1)) not in allowed_flows:
+            continue
+        nd = g_nx.nodes[v]
+        if int(nd.get("function", -1)) != int(expected_graph_func_id):
+            continue
+        if int(nd.get("type", -1)) in skip_types:
+            continue
+        if v not in seen:
+            seen.add(v)
+            yield v, nd
+
+
+def _is_array_semantic_bridge(ndata, var_regexes):
+    ft = _get_node_full_text(ndata)
+    if not isinstance(ft, str):
+        return False
+    ft = ft.split('!dbg')[0].strip()
+
+    if _node_mentions_var(ft, var_regexes):
+        return True
+
+    return any(tok in ft for tok in (
+        "getelementptr",
+        "bitcast",
+        "load",
+        "store",
+    ))
+
+
+def _collect_array_call_relays(
+    g_nx,
+    seed_nodes,
+    expected_graph_func_id,
+    var_regexes,
+    max_hops=2,
+):
+    """
+    Find caller-side call relays, but only through array-relevant paths.
+    Reject spurious paths through immediates like i64 0.
+    """
+    queue = []
+    visited = set()
+    relays = []
+
+    for node, ndata in seed_nodes:
+        queue.append((node, 0, True))   # seed nodes are already array-relevant
+        visited.add((node, True))
+
+    while queue:
+        cur, dist, is_array_relevant = queue.pop(0)
+        if dist >= max_hops:
+            continue
+
+        for nb, nd in _iter_same_func_flow_neighbors(
+            g_nx,
+            cur,
+            expected_graph_func_id,
+            allowed_flows=(1,),
+            skip_types=(2,),   # skip immediates
+        ):
+            next_relevant = is_array_relevant or _is_array_semantic_bridge(nd, var_regexes)
+
+            if _is_call_target(nd):
+                # Only keep the call if we reached it through an array-relevant path
+                if is_array_relevant:
+                    relays.append((nb, nd, dist + 1))
+                continue
+
+            state = (nb, next_relevant)
+            if state in visited:
+                continue
+            visited.add(state)
+            queue.append((nb, dist + 1, next_relevant))
+
+    relays = sorted(relays, key=lambda x: (x[2], _array_target_priority(x[0], x[1])))
+
+    out = []
+    seen = set()
+    for n, d, _ in relays:
+        if n not in seen:
+            seen.add(n)
+            out.append((n, d))
+    return out
+
+
+def _select_array_scope_targets(
+    matched_nodes,
+    decl_candidates,
+    relay_nodes=None,
+    max_total=ARRAY_SCOPE_MAX_TARGETS,
+    max_per_block=ARRAY_SCOPE_MAX_PER_BLOCK,
+):
+    matched_nodes = sorted(matched_nodes, key=lambda nd: _node_sort_key(nd[0], nd[1]))
+    decl_candidates = sorted(decl_candidates, key=lambda nd: _node_sort_key(nd[0], nd[1]))
+    relay_nodes = [] if relay_nodes is None else sorted(
+        relay_nodes, key=lambda nd: _array_target_priority(nd[0], nd[1])
+    )
+
+    selected = []
+    seen = set()
+
+    # 1) declaration first
+    if decl_candidates:
+        node0, data0 = decl_candidates[0]
+        selected.append((node0, data0))
+        seen.add(node0)
+
+    # 2) reserve up to two distinct caller-side call relays if present
+    kept_callees = set()
+    for node0, data0 in relay_nodes:
+        callee = _call_callee_name(data0)
+        if node0 in seen:
+            continue
+        if callee in kept_callees:
+            continue
+
+        selected.append((node0, data0))
+        seen.add(node0)
+        kept_callees.add(callee)
+
+        if len(kept_callees) >= 2 or len(selected) >= max_total:
+            break
+
+    # 3) preserve per-block coverage
+    by_block = {}
+    for node, ndata in matched_nodes:
+        if node in seen:
+            continue
+        block = int(ndata.get("block", -1))
+        by_block.setdefault(block, []).append((node, ndata))
+
+    for block in sorted(by_block.keys()):
+        ranked = sorted(by_block[block], key=lambda nd: _array_target_priority(nd[0], nd[1]))
+        taken = 0
+        for node, ndata in ranked:
+            if node in seen:
+                continue
+            selected.append((node, ndata))
+            seen.add(node)
+            taken += 1
+            if len(selected) >= max_total or taken >= max_per_block:
+                break
+        if len(selected) >= max_total:
+            break
+
+    # 4) fill remaining budget globally
+    if len(selected) < max_total:
+        leftovers = []
+        for block in sorted(by_block.keys()):
+            leftovers.extend(by_block[block])
+        leftovers = sorted(leftovers, key=lambda nd: _array_target_priority(nd[0], nd[1]))
+
+        for node, ndata in leftovers:
+            if node in seen:
+                continue
+            selected.append((node, ndata))
+            seen.add(node)
+            if len(selected) >= max_total:
+                break
+
+    return selected
 
 
 def create_pragma_nodes(g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for_dict_llvm, log=False):
     """
     Create pragma nodes (loop pragmas + array pragmas) and edges.
-
     - Loop pragmas are attached to the LLVM icmp node of the corresponding loop.
-    - Array pragmas are attached to the LLVM node(s) corresponding to the array variable.
+    - Array pragmas are attached to LLVM nodes that reference the correct array in the correct function, using token-aware matching.
     """
     new_nodes, new_edges = [], []
     next_node_id = g_nx_nodes
 
-    # Load loop tripcounts from kernel_info.txt
     tripcounts_by_label = load_tripcounts_by_label(kernel_info_file)
     eligible_labels = set(tripcounts_by_label.keys())
+    llvm_func_bodies = _parse_llvm_function_bodies(kernel_info_file)
 
-    # Helper functions
     def resolve_llvm_key(src_func_name: str):
         """
         Find the LLVM function definition that corresponds to src_func_name.
         """
-        # Collect candidate matches with different confidence levels
         exact_matches = []
         suffix_matches = []
         substring_matches = []
 
         for key in sorted(for_dict_llvm.keys()):
-#        for key in for_dict_llvm.keys():
             m = re.search(r'@([^(]+)\s*\(', key)
             if not m:
                 continue
@@ -693,171 +905,124 @@ def create_pragma_nodes(g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for
                 try:
                     name_len = int(m2.group(1))
                     candidate = m2.group(2)
-                    # If the length prefix matches the name length, accept it
                     if len(candidate) == name_len:
                         demangled = candidate
                 except ValueError:
                     pass
 
-            # Fallback: if we can't demangle, just treat mangled as the name
             if demangled is None:
                 demangled = mangled
 
-            # Strongest: exact match on demangled or mangled name
             if demangled == src_func_name or mangled == src_func_name:
                 exact_matches.append(key)
                 continue
 
-            # Next: demangled or mangled ends with the source name
             if demangled.endswith(src_func_name) or mangled.endswith(src_func_name):
                 suffix_matches.append(key)
                 continue
 
-            # Weakest: source name appears as a substring
             if src_func_name in mangled or src_func_name in demangled:
                 substring_matches.append(key)
 
-        # Choose the best category that gives a unique match
         if len(exact_matches) == 1:
             return exact_matches[0]
         if len(exact_matches) > 1:
-            print(
-                f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' "
-                f"(exact): {exact_matches}. Skipping pragmas for this function."
-            )
+            print(f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' (exact): {exact_matches}")
             return None
 
         if len(suffix_matches) == 1:
             return suffix_matches[0]
         if len(suffix_matches) > 1:
-            print(
-                f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' "
-                f"(suffix): {suffix_matches}. Skipping pragmas for this function."
-            )
+            print(f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' (suffix): {suffix_matches}")
             return None
 
         if len(substring_matches) == 1:
             return substring_matches[0]
         if len(substring_matches) > 1:
-            print(
-                f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' "
-                f"(substring): {substring_matches}. Skipping pragmas for this function."
-            )
+            print(f"[WARN] Multiple LLVM functions matched source function '{src_func_name}' (substring): {substring_matches}")
             return None
 
-        # If still nothing, preserve your old fallback behavior
         if len(for_dict_llvm) == 1:
             only_key = next(iter(for_dict_llvm.keys()))
-            print(
-                f"[WARN] No LLVM function matched source function '{src_func_name}'. "
-                f"Falling back to the sole LLVM function '{only_key}'."
-            )
+            print(f"[WARN] No LLVM function matched source function '{src_func_name}'. Falling back to sole LLVM function '{only_key}'.")
             return only_key
 
-        print(
-            f"[WARN] Could not match source function '{src_func_name}' "
-            f"to any LLVM function. Available: {list(for_dict_llvm.keys())}. "
-            f"Skipping pragmas for this function."
-        )
+        print(f"[WARN] Could not match source function '{src_func_name}' to any LLVM function. Available: {list(for_dict_llvm.keys())}")
         return None
-
 
     def find_icmp_node(icmp_inst: str, expected_graph_func_id=None):
         """
-        Find the node id (and its block/function) whose full_text matches icmp_inst.
-
-        If expected_graph_func_id is given, restrict matches to that graph function.
-        Returns (node_id, block_id, function_id) or (None, None, None).
+        Find the graph node whose full_text exactly matches icmp_inst,
+        optionally restricting to a single graph function-id.
         """
-        icmp_inst = icmp_inst.split('!dbg')[0].strip()
-
+        target = icmp_inst.split('!dbg')[0].strip()
         matches = []
+
         for node, ndata in g_nx.nodes(data=True):
-            full_text = None
-            if "features" in ndata:
-                try:
-                    feat = ast.literal_eval(str(ndata["features"]))
-                    full_text = feat.get("full_text", [None])[0]
-                except Exception:
-                    pass
-            elif "full_text" in ndata:
-                full_text = ndata["full_text"]
+            if expected_graph_func_id is not None:
+                if int(ndata.get("function", -1)) != int(expected_graph_func_id):
+                    continue
 
-            if isinstance(full_text, str):
-                full_text = full_text.split('!dbg')[0].strip()
+            full_text = _get_node_full_text(ndata)
+            if not isinstance(full_text, str):
+                continue
 
-            if full_text == icmp_inst:
+            full_text = full_text.split('!dbg')[0].strip()
+            if full_text == target:
                 matches.append((node, ndata))
 
         if not matches:
             return None, None, None
 
-        # Restrict to expected graph function if possible
-        if expected_graph_func_id is not None:
-            matches = [
-                (node, ndata)
-                for node, ndata in matches
-                if int(ndata.get("function", -1)) == int(expected_graph_func_id)
-            ]
-            if not matches:
-                return None, None, None
-
-        def stable_key(item):
-            node_id, data = item
-            f_id = int(data.get("function", -1))
-            b_id = int(data.get("block", -1))
-            return (f_id, b_id, int(node_id))
-
-        matches.sort(key=stable_key)
-
-        if len(matches) > 1:
-            raise RuntimeError(
-            f"Ambiguous icmp match inside function for instruction: {icmp_inst}. "
-            f"Candidates: {[int(node) for node, _ in matches]}"
-        )
+        matches = sorted(matches, key=lambda nd: _node_sort_key(nd[0], nd[1]))
+        if len(matches) > 1 and log:
+            print(
+                f"[WARN] Multiple icmp-node matches for '{target}' "
+                f"in function {expected_graph_func_id}; choosing the first deterministically."
+            )
 
         node0, data0 = matches[0]
         block_id = int(data0.get("block", -1))
         func_id = int(data0.get("function", -1))
         return int(node0), block_id, func_id
 
+    graph_func_ids = sorted({
+        int(ndata.get("function", -1))
+        for _, ndata in g_nx.nodes(data=True)
+        if int(ndata.get("function", -1)) != -1
+    })
 
-    llvm_func_bodies = _parse_llvm_function_bodies(kernel_info_file)
-
+    # --------------------------------------------------
     # LOOP PRAGMAS
-#    for f_name, f_content in for_dict_source.items():
+    # --------------------------------------------------
     for f_name in sorted(for_dict_source.keys()):
         f_content = for_dict_source[f_name]
-        if not f_content:  # no loops/pragmas in this function
+        if not f_content:
             continue
 
         llvm_key = resolve_llvm_key(f_name)
         if llvm_key is None:
-            # We could not map this source function to an LLVM function; skip it.
             continue
 
         llvm_content = for_dict_llvm[llvm_key]
         expected_graph_func_id = infer_graph_function_id(g_nx, llvm_key, llvm_func_bodies)
         if expected_graph_func_id is None:
             raise RuntimeError(
-                f"Could not infer graph function id for source function '{f_name}' "
+                f"Could not infer graph function-id for loop source function '{f_name}' "
                 f"(LLVM key: {llvm_key}). Refusing global fallback."
             )
 
-#        for for_loop_id, payload in f_content.items():
         for for_loop_id in sorted(f_content.keys()):
             payload = f_content[for_loop_id]
-            # Unify payload format
+
             if isinstance(payload, dict):
                 for_loop_text = payload["loop_line"]
                 pragmas = payload["pragmas"]
                 local_id = payload.get("local_id", for_loop_id)
             else:
-                # Original format: {local_id: [loop_line, pragmas]}
                 for_loop_text, pragmas = payload
                 local_id = for_loop_id
 
-            # Ensure we have a matching LLVM loop entry
             if local_id not in llvm_content:
                 print(
                     f"[WARN] LLVM loop id {local_id} not found for function '{f_name}' "
@@ -866,32 +1031,26 @@ def create_pragma_nodes(g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for
                 continue
 
             icmp_inst = llvm_content[local_id][0]
-
-            # Tripcount consistency check + label extraction
             label = check_tripcount_consistency(for_loop_text, icmp_inst, tripcounts_by_label)
 
-            # Skip labeled loops that do not appear in kernel_info.txt
             if label and label not in eligible_labels:
                 continue
 
-            # Find the LLVM node corresponding to icmp_inst
             node_id, block_id, function_id = find_icmp_node(
                 icmp_inst,
                 expected_graph_func_id=expected_graph_func_id,
-                )
-            
+            )
             if node_id is None:
                 print(f"[WARN] icmp instruction not found in graph: {icmp_inst}")
                 continue
 
-            # Create pragma nodes for each pragma line attached to this loop
             for pragma in pragmas:
                 tokens = pragma.split()
                 if len(tokens) < 3:
                     print(f"[WARN] Unexpected pragma format (too few tokens): {pragma}")
                     continue
 
-                pragma_kind = tokens[2].upper()  # "PIPELINE", "UNROLL", etc.
+                pragma_kind = tokens[2].upper()
                 if pragma_kind not in PRAGMA_POSITION:
                     print(f"[WARN] Skipping unknown pragma kind: {pragma_kind}")
                     continue
@@ -903,21 +1062,20 @@ def create_pragma_nodes(g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for
                     "features": {"full_text": [pragma]},
                     "text": pragma_kind,
                 }
-
                 new_nodes.append((next_node_id, p_dict))
 
                 e_attr = {"flow": 200, "position": PRAGMA_POSITION[pragma_kind]}
-                # bidirectional edges between loop icmp node and pragma node
                 new_edges.append((node_id, next_node_id, e_attr))
                 new_edges.append((next_node_id, node_id, e_attr))
 
                 next_node_id += 1
 
+    # --------------------------------------------------
     # ARRAY PRAGMAS
+    # --------------------------------------------------
     src_dir = os.path.dirname(kernel_info_file)
     kernel_name = os.path.basename(src_dir)
 
-    # Support both C and C++ placeholder files: <kernel>_placeholders.c/.cpp
     placeholder_src = None
     for ext in (".cpp", ".c"):
         candidate = os.path.join(src_dir, f"{kernel_name}_placeholders{ext}")
@@ -927,79 +1085,164 @@ def create_pragma_nodes(g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for
 
     if placeholder_src:
         array_pragmas = get_pragmas_arrays(placeholder_src, log=log)
-        array_pragmas = sorted(array_pragmas, key=lambda x: (x['function'] or '', x['var']))
+        array_pragmas = sorted(array_pragmas, key=lambda x: (x["function"] or "", x["var"], x["pragma"]))
+
         for ap in array_pragmas:
+            src_func_name = ap["function"]
             varname = ap["var"]
             pragma_line = ap["pragma"]
 
-            matched_nodes = []
-            decl_candidates = []  # prefer nodes that look like the declaration
-
-            for node, ndata in g_nx.nodes(data=True):
-                full_text = None
-                if "features" in ndata:
-                    try:
-                        feat = ast.literal_eval(str(ndata["features"]))
-                        full_text = feat.get("full_text", [None])[0]
-                    except Exception:
-                        pass
-                elif "full_text" in ndata:
-                    full_text = ndata["full_text"]
-
-                if not full_text:
+            # Map source function -> LLVM function -> numeric graph function-id
+            if src_func_name is None:
+                if len(graph_func_ids) == 1:
+                    expected_graph_func_id = graph_func_ids[0]
+                else:
+                    print(
+                        f"[WARN] Array pragma for variable '{varname}' has no source-function "
+                        f"and graph has multiple functions {graph_func_ids}. Skipping.\n"
+                        f"  pragma: {pragma_line}"
+                    )
+                    continue
+            else:
+                llvm_key = resolve_llvm_key(src_func_name)
+                if llvm_key is None:
+                    print(
+                        f"[WARN] Could not resolve LLVM function for array pragma variable '{varname}' "
+                        f"in source function '{src_func_name}'. Skipping."
+                    )
                     continue
 
-                ft_str = str(full_text)
-                if varname not in ft_str:
+                expected_graph_func_id = infer_graph_function_id(g_nx, llvm_key, llvm_func_bodies)
+                if expected_graph_func_id is None:
+                    raise RuntimeError(
+                        f"Could not infer graph function-id for array pragma variable '{varname}' "
+                        f"in source function '{src_func_name}' (LLVM key: {llvm_key})."
+                    )
+
+            var_regexes = _compile_var_token_regexes(varname)
+
+            matched_nodes = []
+            decl_candidates = []
+
+            for node, ndata in g_nx.nodes(data=True):
+                if int(ndata.get("function", -1)) != int(expected_graph_func_id):
+                    continue
+
+                ntype = int(ndata.get("type", -1))
+                if ntype not in (0, 1):
+                    continue
+
+                full_text = _get_node_full_text(ndata)
+                if not isinstance(full_text, str):
+                    continue
+
+                ft_str = full_text.split('!dbg')[0].strip()
+                if not _node_mentions_var(ft_str, var_regexes):
                     continue
 
                 matched_nodes.append((node, ndata))
 
-                # array declaration in LLVM looks like %var = alloca [N x <type>], ...
-                if "alloca" in ft_str and "[" in ft_str and "]" in ft_str:
+                if _is_array_decl_candidate(ft_str, varname):
                     decl_candidates.append((node, ndata))
 
             if not matched_nodes:
                 if log:
-                    print(f"[WARN] No variable node found for array '{varname}' "
-                          f"(pragma: {pragma_line})")
+                    print(
+                        f"[WARN] No graph node found for array '{varname}' "
+                        f"in function-id {expected_graph_func_id} "
+                        f"(pragma: {pragma_line})"
+                    )
                 continue
 
-            # Prefer the declaration node, otherwise first match (deterministic)
             matched_nodes = sorted(matched_nodes, key=lambda nd: _node_sort_key(nd[0], nd[1]))
+            seen = set()
+            matched_nodes = [(n, d) for (n, d) in matched_nodes if not (n in seen or seen.add(n))]
+
             decl_candidates = sorted(decl_candidates, key=lambda nd: _node_sort_key(nd[0], nd[1]))
+
+            # canonical home of the array scope = declaration block if available
             if decl_candidates:
-                node0, data0 = decl_candidates[0]
+                anchor_node, anchor_data = decl_candidates[0]
             else:
-                node0, data0 = matched_nodes[0]
+                anchor_node, anchor_data = matched_nodes[0]
 
-            block_id = int(data0.get("block", -1))
-            function_id = int(data0.get("function", -1))
+            block_id = int(anchor_data.get("block", -1))
+            function_id = int(anchor_data.get("function", -1))
 
-            p_dict = {
+            # 1) create pragma node
+            pragma_node_id = next_node_id
+            next_node_id += 1
+
+            pragma_dict = {
                 "type": 100,
                 "block": block_id,
                 "function": function_id,
                 "features": {"full_text": [pragma_line]},
                 "text": "ARRAY_PARTITION",
             }
-            new_nodes.append((next_node_id, p_dict))
+            new_nodes.append((pragma_node_id, pragma_dict))
 
-            e_attr = {"flow": 200, "position": PRAGMA_POSITION["ARRAY_PARTITION"]}
-
-            # Attach pragma node to all uses/declaration nodes of that array
-            for node, _ in matched_nodes:
-                new_edges.append((node, next_node_id, e_attr))
-                new_edges.append((next_node_id, node, e_attr))
-
+            # 2) create array-scope node
+            scope_node_id = next_node_id
             next_node_id += 1
+
+            scope_node = create_array_scope_node(
+                block=block_id,
+                function=function_id,
+                varname=varname,
+                pragma_line=pragma_line,
+            )
+            scope_dict = scope_node.get_attr(after_process=False)
+            scope_dict["array_var"] = varname
+            new_nodes.append((scope_node_id, scope_dict))
+
+            # 3) pragma <-> array-scope (same semantic role as loop pragma <-> icmp)
+            pragma_edge_attr = {
+                "flow": 200,
+                "position": PRAGMA_POSITION["ARRAY_PARTITION"],
+            }
+            new_edges.append((pragma_node_id, scope_node_id, pragma_edge_attr))
+            new_edges.append((scope_node_id, pragma_node_id, pragma_edge_attr))
+
+            # 4) array-scope <-> representative declaration/use targets
+            relay_nodes = _collect_array_call_relays(
+                g_nx,
+                matched_nodes,
+                expected_graph_func_id=expected_graph_func_id,
+                var_regexes=var_regexes,
+                max_hops=2,
+            )
+
+            selected_targets = _select_array_scope_targets(
+                matched_nodes=matched_nodes,
+                decl_candidates=decl_candidates,
+                relay_nodes=relay_nodes,
+            )
+
+            for pos, (node, _) in enumerate(selected_targets):
+                scope_edge_attr = {
+                    "flow": ARRAY_SCOPE_EDGE_FLOW,
+                    "position": pos,
+                }
+                new_edges.append((scope_node_id, node, scope_edge_attr))
+                new_edges.append((node, scope_node_id, scope_edge_attr))
+
+            if log:
+                touched_blocks = sorted({int(nd.get("block", -1)) for _, nd in selected_targets})
+                print(
+                    f"[INFO] ARRAY scope created: var={varname} "
+                    f"src_func={src_func_name} graph_func={function_id} "
+                    f"decl_found={bool(decl_candidates)} "
+                    f"relay_found={bool(relay_nodes)} "
+                    f"selected_targets={len(selected_targets)} "
+                    f"blocks={touched_blocks}"
+                )
 
     if log:
         pprint(new_nodes)
         pprint(new_edges)
 
     return new_nodes, new_edges
-
 
 
 
@@ -1017,153 +1260,6 @@ def prune_redundant_nodes(g_new):
         if not remove_nodes:
             break
         g_new.remove_nodes_from(remove_nodes)
-
-
-def process_graph(name, g, csv_dict=None):
-    '''
-        adjusts the node/edge attributes, removes redundant nodes,
-            and writes the final graph to be used by GNN-DSE
-
-        Determinism note:
-            NetworkX does not guarantee stable edge iteration order across runs.
-            We therefore (a) insert nodes in a sorted order, (b) insert edges in a
-            sorted order, and (c) assign edge ids after sorting.
-    '''
-    g_new = nx.MultiDiGraph()
-
-    # Deterministic node insertion
-    for node, ndata in sorted(g.nodes(data=True), key=lambda nd: _node_sort_key(nd[0], nd[1])):
-        attrs = deepcopy(ndata)
-        if 'features' in attrs:
-            feat = attrs['features']
-            attrs['full_text'] = feat['full_text'][0]
-            del attrs['features']
-        g_new.add_node(node, **attrs)
-
-    # Rank nodes for deterministic edge sorting
-    node_rank = {n: i for i, (n, _) in enumerate(sorted(g_new.nodes(data=True), key=lambda nd: _node_sort_key(nd[0], nd[1])))}
-
-    # Deterministic edge insertion (and edge id assignment)
-    edges = []
-    for u, v, edata in g.edges(data=True):
-        edges.append((u, v, deepcopy(edata)))
-
-    def _edge_key(e):
-        u, v, d = e
-        return (
-            node_rank.get(u, 10**9),
-            node_rank.get(v, 10**9),
-            int(d.get('flow', -1)),
-            int(d.get('position', -1)),
-            str(u),
-            str(v),
-        )
-
-    edge_list = []
- #   for eid, (u, v, edata) in enumerate(sorted(edges, key=_edge_key)):
- #       edata['id'] = eid
- #       edge_list.append((u, v, edata))
-    for u, v, k, edata in g.edges(keys=True, data=True):
-        edge_list.append((u, v, k, edata))
-
-    def edge_sort_stable(e):
-        u, v, k, d = e
-        # Sort by source rank, then dest rank, then flow type, then position
-        return (node_rank[u], node_rank[v], d.get('flow', 0), d.get('position', 0), str(k))
-    
-    for u, v, k, edata in sorted(edge_list, key=edge_sort_stable):
-        g_new.add_edge(u, v, key=k, **deepcopy(edata))    
-
-    # g_new.add_edges_from(edge_list)
-
-    prune_redundant_nodes(g_new)
-
-    # Canonicalize insertion order for stable serialization (keeps ids as attributes)
-    g_new = canonicalize_for_gexf(g_new)
-
-    original_gexf_folder = join(processed_gexf_folder, 'original')
-    create_dir_if_not_exists(original_gexf_folder)
-    new_gexf_file = join(original_gexf_folder, f'{name}_processed_result.gexf')
-    os.makedirs(processed_gexf_folder, exist_ok=True)
-    nx.write_gexf(g_new, new_gexf_file)
-
-    current_g_value = {
-        'num_node': len(g_new.nodes),
-        'num_edge': len(g_new.edges),
-        'name': name,
-    }
-    if csv_dict:
-        csv_dict[name] = current_g_value
-
-
-
-def graph_generator(name, path, benchmark, src_ext="cpp", generate_programl=False, csv_dict=None, top_func=None):
-    """
-        runs ProGraML [ICML'21] to generate the graph, adds the pragma nodes,
-            processes the final graph to be accepted by GNN-DSE
-
-        args:
-            name: kernel name
-            path: path to parent directory of the kernel file
-            benchmark: [machsuite|poly] None: simple program
-            src_ext: "c" or "cpp" (extension *without* dot) for the placeholder file
-    """
-    ## generate PrograML graph
-    if generate_programl:
-        cmd = ["/bin/bash", f"{get_root_path()}/src/clang_script.sh", str(name), str(path), str(type_graph)]
-        p = Popen(cmd, stdout=PIPE, stderr=PIPE, text=True)
-        out, err = p.communicate()
-        print("returncode:", p.returncode)
-        print("stdout:\n", out)
-        print("stderr:\n", err)
-
-    ## convert it to networkx format
-    g_nx = llvm_to_nx(join(path, name))
-    g_nx_nodes, g_nx_edges = g_nx.number_of_nodes(), len(g_nx.edges)
-
-    ## find for loops and icmp instructions in llvm code
-    for_dict_llvm, for_count_llvm = get_icmp(path, name)
-
-    ## find for loops and their pragmas in the C/C++ code (placeholder file)
-    for_dict_source, for_count_source = get_pragmas_loops(
-        path,
-        f'{name}_placeholders',
-        EXT=src_ext,          # works with both .c and .cpp
-    )
-    assert for_count_llvm == for_count_source, (
-        f'the number of for loops from the LLVM code and source code do not match '
-        f'{for_count_llvm} in llvm vs {for_count_source} in the code'
-    )
-
-    print(f'number of nodes: {g_nx_nodes} and number of edges: {g_nx_edges}')
-    graph_path = join(path, name+'.gexf')
-    nx.write_gexf(canonicalize_for_gexf(g_nx), graph_path)
-
-    augment_graph = True
-    if augment_graph:
-        kernel_info_file = os.path.join(path, 'kernel_info.txt')
-        new_nodes, new_edges = create_pragma_nodes(
-            g_nx, g_nx_nodes, kernel_info_file, for_dict_source, for_dict_llvm
-        )
-
-        add_to_graph(g_nx, new_nodes, new_edges)
-        print(f'number of new nodes: {g_nx.number_of_nodes()} and number of new edges: {len(g_nx.edges)}')
-        process = True
-        if process:
-            process_graph(name, g_nx, csv_dict)
-
-    copy_files_ = True
-    if generate_programl:
-        copy_files = True
-    local = True  # True: programl is running in the directories inside this project
-    if copy_files_:
-        if not local:
-            dest = join(os.getcwd(), f'{type_graph}', benchmark, name)
-            create_dir_if_not_exists(dest)
-            copy_files(name, path, dest)
-        else:
-            dest = path
-
 
 
 def get_for_blocks_info(name, path):
@@ -1232,94 +1328,6 @@ def get_for_blocks_info(name, path):
     return for_blocks_info
 
 
-
-
-def add_auxiliary_nodes(name, path, processed_path, csv_dict, node_type = 'block', connected = False):
-    if node_type == 'block':
-        gexf_file = join(path, 'original', f'{name}_processed_result.gexf')
-        new_gexf_file = join(processed_path, f'{name}_processed_result.gexf')
-        if not isfile(gexf_file):
-            print(f'Processed graph not found for kernel "{name}": {gexf_file} — skipping')
-            return None
-        print(f'processing {gexf_file}')
-        g = nx.readwrite.gexf.read_gexf(gexf_file, node_type=str)
-        g_nx_nodes, g_nx_edges = g.number_of_nodes(), len(g.edges)
-        print(f'started with {g_nx_nodes} nodes and {g_nx_edges} edges')
-        current_g_value = {}
-        current_g_value['name'] = name
-        current_g_value['prev_node'] = g_nx_nodes
-        current_g_value['prev_edge'] = g_nx_edges
-        orig_nodes = g_nx_nodes
-        block_nodes = {}
-        new_edges = [(nid1, nid2, edata) for nid1, nid2, edata in g.edges(data=True)]
-        new_nodes = [(node, ndata) for node, ndata in g.nodes(data=True)]
-        block_func = {}
-        block_func = {}
-        max_block = 0
-        g_new = nx.MultiDiGraph()
-        id = g_nx_edges
-
-        for node, ndata in sorted(g.nodes(data=True), key=lambda nd: _node_sort_key(nd[0], nd[1])):
-            if f"function-{ndata['function']}-block-{ndata['block']}" not in block_nodes:
-                new_node = create_pseudo_node_block(ndata['block'], ndata['function'])
-                block_nodes[f"function-{ndata['function']}-block-{ndata['block']}"] = {'id': g_nx_nodes, 'node': new_node, 'last_position': 0}
-                new_nodes.append((g_nx_nodes, new_node.get_attr(after_process = True)))
-                g_nx_nodes += 1
-
-            if ndata['function'] not in block_func:
-                block_func[ndata['function']] = {}
-                block_func[ndata['function']]['count'] = 1
-                block_func[ndata['function']]['blocks'] = [ndata['block']]
-            else:
-                if ndata['block'] not in block_func[ndata['function']]['blocks']:
-                    block_func[ndata['function']]['count'] += 1
-                    block_func[ndata['function']]['blocks'].append(ndata['block'])
-
-            key = f"function-{ndata['function']}-block-{ndata['block']}"
-            pseudo_node = block_nodes[key]['node']
-            pseudo_id = block_nodes[key]['id']
-            pseudo_position = block_nodes[key]['last_position']
-            assert pseudo_node.function == ndata['function']
-            e_dict = {'id': id, 'flow': 4, 'position': pseudo_position}
-            new_edges.append((node, pseudo_id, e_dict))
-            id += 1
-            e_dict = {'id': id, 'flow': 4, 'position': pseudo_position}
-            new_edges.append((pseudo_id, node, e_dict))
-            id += 1
-            block_nodes[key]['last_position'] = pseudo_position + 1
-
-        if connected:
-            ## add edge between the new nodes
-            sorted_nodes = sorted(block_nodes.keys(), key=natural_keys)
-            for idx, node in enumerate(sorted_nodes[:-1]):
-                id1 = block_nodes[node]['id']
-                id2 = block_nodes[sorted_nodes[idx+1]]['id']
-                e_dict = {'id': id, 'flow': 5, 'position': 0} ## assign a new flow to it
-                new_edges.append((id1, id2, e_dict))
-                id += 1
-                e_dict = {'id': id, 'flow': 5, 'position': 0}
-                new_edges.append((id2, id1, e_dict))
-                id += 1
-
-
-        add_to_graph(g_new, nodes = new_nodes, edges = new_edges)
-        prune_redundant_nodes(g_new)
-        g_nx_nodes, g_nx_edges = g_new.number_of_nodes(), len(g_new.edges)
-        for f, b in block_func.items():
-            # print(f, b)
-            max_block += b['count']
-        assert g_nx_nodes == orig_nodes + max_block
-        print(f'ending with {g_nx_nodes} nodes and {g_nx_edges} edges, max block: {max_block}')
-        current_g_value['new_node'] = g_nx_nodes
-        current_g_value['new_edge'] = g_nx_edges
-        current_g_value['block'] = max_block
-        if csv_dict: csv_dict[name] = current_g_value
-        nx.write_gexf(canonicalize_for_gexf(g_new), new_gexf_file)
-
-    else:
-        raise NotImplementedError()
-
-
 def load_kernel_source_map(csv_path):
     """
     Load a mapping from kernel directory name (app_name) -> metadata.
@@ -1369,20 +1377,6 @@ def load_kernel_source_map(csv_path):
     return mapping
 
 
-def remove_extra_header(src_dir, kernel_name):
-    from tempfile import mkstemp
-    orig_file = join(src_dir, f'{kernel_name}.c')
-    fnew, abs_path = mkstemp()
-    with open(fnew, 'w') as fpnew:
-        with open(orig_file) as fp:
-            for line in fp:
-                if line.startswith('#include') and 'merlin_type_define' in line:
-                    continue
-                fpnew.write(line)
-
-    shutil.copymode(orig_file, abs_path)
-    shutil.copy(abs_path, orig_file)
-
 def write_csv_file(csv_dict, csv_header, file_path):
     with open(join(get_root_path(), file_path), mode = 'w') as f:
         f_writer = csv.DictWriter(f, fieldnames=csv_header)
@@ -1391,162 +1385,6 @@ def write_csv_file(csv_dict, csv_header, file_path):
             if d == 'header':
                 continue
             f_writer.writerow(value)
-
-def normalize_part(p):
-    # Strip trailing digits and letters after digits, e.g. 'stencil2d' -> 'stencil'
-    return re.sub(r'\d.*$', '', p)
-
-
-# def run_graph_gen(mode='initial', connected=True):
-#     test = 'original'
-#     global processed_gexf_folder
-#     base_dataset_dir = "/home/elvouvali/Data4LLMPrompting/ApplicationDataset"
-#     csvs_dir = "/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS"
-#     source_map_csv = "/home/elvouvali/Data4LLMPrompting/ApplicationInformation.csv"
-
-#     if mode == 'initial':
-#         source_map = load_kernel_source_map(source_map_csv)
-
-#     if mode == 'initial':
-#         csv_header = ['name', 'num_node', 'num_edge']
-#     else:
-#         csv_header = ['name', 'prev_node', 'prev_edge', 'new_node', 'new_edge']
-#     if mode == 'auxiliary':
-#         csv_header.append('block')
-#     csv_dict = {'header': csv_header}
-
-#     if mode == 'initial':
-#         for kernel in sorted(os.listdir(base_dataset_dir)):
-#             kernel_path = os.path.join(base_dataset_dir, kernel)
-
-#             # get the source file info from the CSV mapping
-#             if kernel not in source_map:
-#                 raise RuntimeError(
-#                     f"No source mapping found in CSV for kernel '{kernel}'"
-#                 )
-#             info = source_map[kernel]
-#             orig_src_name = info["file_name"]
-#             ext = info["ext"]
-#             src_ext = ext.lstrip('.')
-#             top_func = info["top"]
-
-#             src_path = os.path.join(kernel_path, orig_src_name)
-#             if not os.path.isfile(src_path):
-#                 raise FileNotFoundError(
-#                     f"Mapped source file '{src_path}' does not exist "
-#                     f"for kernel '{kernel}'"
-#                 )
-
-#             header_files = list(iglob(os.path.join(kernel_path, "*.h"), recursive=False))
-#             kernel_info_file = glob.glob(os.path.join(kernel_path, "kernel_info.txt"))[0]
-
-#             print('####################')
-#             print('Now processing', kernel)
-#             harp_kernel_dir = join(get_root_path(), f'{type_graph}/{kernel}')
-
-#             if not exists(harp_kernel_dir):
-#                 create_dir_if_not_exists(harp_kernel_dir)
-
-#                 # Copy the source as <kernel>.c or <kernel>.cpp into harp/...
-#                 new_src_path = os.path.join(harp_kernel_dir, f"{kernel}{ext}")
-#                 shutil.copyfile(src_path, new_src_path)
-
-#                 # copy headers as before
-#                 for header_file in header_files:
-#                     new_header_path = os.path.join(harp_kernel_dir, os.path.basename(header_file))
-#                     shutil.copyfile(header_file, new_header_path)
-
-#                 new_kernel_info_path = os.path.join(harp_kernel_dir, 'kernel_info.txt')
-#                 shutil.copyfile(kernel_info_file, new_kernel_info_path)
-
-#                 # insert placeholders on the *copied* file (kernel.c or kernel.cpp)
-#                 placeholder_lines = insert_placeholders(new_src_path)
-#                 placeholders_src_path = os.path.join(harp_kernel_dir, f"{kernel}_placeholders{ext}")
-#                 with open(placeholders_src_path, "w") as f:
-#                     f.writelines(placeholder_lines)
-
-#             if not exists(processed_gexf_folder):
-#                 create_dir_if_not_exists(processed_gexf_folder)
-
-#             graph_generator(
-#                 kernel,
-#                 harp_kernel_dir,
-#                 kernel,
-#                 src_ext=src_ext,
-#                 generate_programl=True,
-#                 csv_dict=csv_dict,
-#                 top_func=top_func,
-#             )
-#             write_csv_file(csv_dict, csv_header, f'{type_graph}/{mode}.csv')
-
-#     elif mode == 'auxiliary':
-#         if connected:
-#             auxiliary_node_gexf_folder = join(
-#                 get_root_path(),
-#                 f'{type_graph}/processed/extended-pseudo-block-connected/'
-#             )
-#         else:
-#             auxiliary_node_gexf_folder = join(
-#                 get_root_path(),
-#                 f'{type_graph}/processed/extended-pseudo-block-base/'
-#             )
-#         create_dir_if_not_exists(auxiliary_node_gexf_folder)
-
-#         for kernel in sorted(os.listdir(base_dataset_dir)):
-#             print('####################')
-#             print('Now processing', kernel)
-#             # We *don't* need the source file anymore here; graphs already exist.
-#             add_auxiliary_nodes(
-#                 kernel,
-#                 processed_gexf_folder,
-#                 auxiliary_node_gexf_folder,
-#                 csv_dict=csv_dict,
-#                 node_type='block',
-#                 connected=connected
-#             )
-#             print()
-
-#         write_csv_file(csv_dict, csv_header, f'{type_graph}/{mode}_{connected}.csv')
-
-#     elif mode == 'hierarchy':
-#         auxiliary_node_gexf_folder = join(
-#             get_root_path(),
-#             f'{type_graph}/processed/extended-pseudo-block-connected/'
-#         )
-#         dest_path = join(
-#             get_root_path(),
-#             f'{type_graph}/processed/extended-pseudo-block-connected-hierarchy/'
-#         )
-#         create_dir_if_not_exists(dest_path)
-#         assert exists(auxiliary_node_gexf_folder)
-
-#         for kernel in sorted(os.listdir(base_dataset_dir)):
-#             llvm_kernel_dir = join(get_root_path(), f'{type_graph}/{kernel}')
-#             print('####################')
-#             print('now processing', kernel)
-#             for_blocks_info = get_for_blocks_info(kernel, llvm_kernel_dir)
-#             augment_graph_hierarchy(
-#                 kernel,
-#                 for_blocks_info,
-#                 src_path=auxiliary_node_gexf_folder,
-#                 dst_path=dest_path,
-#                 csv_dict=csv_dict
-#             )
-#             print()
-
-#         write_csv_file(csv_dict, csv_header, f'{type_graph}/{mode}.csv')
-
-#     else:
-#         raise NotImplementedError()
-
-
-
-##### Usage ######
-#run_graph_gen(mode='initial', connected=True)
-#run_graph_gen(mode='auxiliary', connected=False)
-#run_graph_gen(mode='auxiliary', connected=True)
-#run_graph_gen(mode='hierarchy', connected=True)
-
 
 
 # =============================
@@ -1585,7 +1423,7 @@ def _require_pythonhashseed() -> None:
             "  PYTHONHASHSEED=0 python -m graph_gen_deterministic\n"
         )
 
-#_require_pythonhashseed()
+_require_pythonhashseed()
 
 
 # -----------------------------
@@ -1812,9 +1650,6 @@ def add_nodes_and_edges_with_explicit_keys(
         G.add_edge(u, v, key=eid, **d)
 
 
-# -----------------------------
-# Deterministic versions of your pipeline entry points
-# -----------------------------
 
 def process_graph(name: str, g: nx.MultiDiGraph, csv_dict: Optional[Dict[str, Any]] = None) -> None:
     """
@@ -2196,16 +2031,15 @@ def augment_graph_hierarchy(
 
 def run_graph_gen(mode: str = "initial", connected: bool = True) -> None:
     """
-    Deterministic entry point mirroring run_graph_gen() but using deterministic
-    wrappers for initial/auxiliary/hierarchy.
+    Deterministic run_graph_gen for each mode : initial/auxiliary/hierarchy.
     """
     # Keep your paths/logic as in run_graph_gen
     test = "original"
     global_processed_gexf_folder = processed_gexf_folder
 
-    base_dataset_dir = "/home/elvouvali/Data4LLMPrompting/ApplicationDataset_2"
-    csvs_dir = "/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS"
-    source_map_csv = "/home/elvouvali/Data4LLMPrompting/ApplicationInformation.csv"
+    base_dataset_dir = "/home/ubuntu/Data4LLMPrompting/ApplicationDataset"
+    csvs_dir = "/home/ubuntu/Data4LLMPrompting/preprocessed_CSVS"
+    source_map_csv = "/home/ubuntu/Data4LLMPrompting/ApplicationInformation.csv"
 
     if mode == "initial":
         source_map = load_kernel_source_map(source_map_csv)
@@ -2312,7 +2146,7 @@ def run_graph_gen(mode: str = "initial", connected: bool = True) -> None:
         )
         dest_path = os.path.join(
             get_root_path(),
-            f"{type_graph}/processed/extended-pseudo-block-connected-hierarchy-2/",
+            f"{type_graph}/processed/extended-pseudo-block-connected-hierarchy/",
         )
         create_dir_if_not_exists(dest_path)
         assert os.path.exists(auxiliary_node_gexf_folder)
