@@ -15,7 +15,8 @@ from sklearn.metrics import mean_squared_error, mean_absolute_error, max_error, 
 
 import torch
 import pytorch_warmup as warmup
-from torch_geometric.data import DataLoader
+from torch_geometric.loader import DataLoader
+from torch.utils.data import Subset
 import torch.nn as nn
 import shutil
 import numpy as np
@@ -29,13 +30,40 @@ from collections import OrderedDict, defaultdict
 import pandas as pd
 
 
+def _as_int_seed(seed):
+    if isinstance(seed, (int, np.integer)):
+        return int(seed)
+    if isinstance(seed, str):
+        return int(seed.strip())
+    raise TypeError(f"random seed must be int-like, got {type(seed)}: {seed}")
+
 
 def gen_dataset(li):
-    train_loader = DataLoader(li[0], batch_size=FLAGS.batch_size, shuffle=True, num_workers=4, pin_memory=False)
-    val_loader = DataLoader(li[1], batch_size=FLAGS.batch_size, num_workers=2, pin_memory=False)
-    test_loader = DataLoader(li[2], batch_size=FLAGS.batch_size, num_workers=2, pin_memory=False)
-    loader = train_loader
-    if len(test_loader.dataset) > 0: loader = test_loader
+    if FLAGS.tiny_overfit:
+        train_workers = FLAGS.tiny_overfit_workers
+        eval_workers = FLAGS.tiny_overfit_workers
+    else:
+        train_workers = FLAGS.num_workers
+        eval_workers = FLAGS.eval_num_workers
+
+    def make_loader(ds, shuffle, workers):
+        kwargs = dict(
+            batch_size=FLAGS.batch_size,
+            shuffle=shuffle,
+            num_workers=workers,
+            pin_memory=False,
+        )
+        if workers > 0:
+            kwargs["prefetch_factor"] = FLAGS.prefetch_factor
+            kwargs["persistent_workers"] = FLAGS.persistent_workers
+        return DataLoader(ds, **kwargs)
+
+    train_loader = make_loader(li[0], shuffle=True,  workers=train_workers)
+    val_loader   = make_loader(li[1], shuffle=False, workers=eval_workers)
+    test_loader  = make_loader(li[2], shuffle=False, workers=eval_workers)
+
+    loader = test_loader if len(test_loader.dataset) > 0 else train_loader
+
     num_features = loader.dataset[0].num_features
     saver.info(f'num features for training: {num_features}')
     edge_dim = loader.dataset[0].edge_attr.shape[1]
@@ -44,10 +72,10 @@ def gen_dataset(li):
     return train_loader, val_loader, test_loader, num_features, edge_dim
 
 
-
 def _take_random_fraction(dataset, frac, seed, *, as_subset=False):
     n = len(dataset)
     k = max(1, int(round(n * frac)))
+    seed = _as_int_seed(seed)
     rng = np.random.default_rng(seed)
     indices = rng.choice(n, size=k, replace=False).tolist()
 
@@ -71,14 +99,67 @@ def _take_random_fraction(dataset, frac, seed, *, as_subset=False):
     )
 
 
+def _take_random_n(dataset, n, seed):
+    n_total = len(dataset)
+    k = min(int(n), n_total)
+    seed = _as_int_seed(seed)
+    rng = np.random.default_rng(seed)
+    indices = rng.choice(n_total, size=k, replace=False).tolist()
+    return Subset(dataset, indices)
+
+
+def _filter_dataset_by_kernel(dataset, kernel_name):
+    """
+    Robust tiny-overfit filtering for the new compact dataset.
+
+    Works even if dataset.processed_file_names / records are not in the
+    exact format we expect, because it filters by actual dataset samples.
+    """
+    selected_indices = []
+
+    # Fast path: if compact records are present as dicts, use them directly
+    records = getattr(dataset, 'records', None)
+    if records is not None and len(records) > 0 and isinstance(records[0], dict):
+        for i, rec in enumerate(records):
+            gname = rec['graph_name']
+            if gname.startswith(kernel_name):
+                selected_indices.append(i)
+    else:
+        # Fallback path: inspect actual samples
+        for i in range(len(dataset)):
+            d = dataset[i]
+            k = d.kernel[0] if isinstance(d.kernel, (list, tuple)) else d.kernel
+            if k == kernel_name:
+                selected_indices.append(i)
+
+    if len(selected_indices) == 0:
+        raise RuntimeError(f'No records found for kernel={kernel_name}')
+
+    return Subset(dataset, selected_indices)
+
+
 def process_split_data(dataset):
     dataset_dict = defaultdict(list)
-    sampled = _take_random_fraction(dataset, frac=1, seed=FLAGS.random_seed)
-    dataset_dict['train'] = sampled
+
+    if FLAGS.tiny_overfit:
+        kernel_ds = _filter_dataset_by_kernel(dataset, FLAGS.tiny_overfit_kernel)
+        tiny_ds = _take_random_n(kernel_ds, FLAGS.tiny_overfit_num_samples, FLAGS.random_seed)
+
+        saver.log_info(
+            f"[tiny_overfit] kernel={FLAGS.tiny_overfit_kernel} "
+            f"num_samples={len(tiny_ds)}"
+        )
+
+        dataset_dict['train'] = tiny_ds
+        dataset_dict['test'] = tiny_ds
+        return dataset_dict
+
+    # Full training: use the whole compact dataset directly
+    dataset_dict['train'] = dataset
     dataset_dict['test'] = None
+
     if not FLAGS.all_kernels:
-        dataset = get_kernel_samples(dataset)
-        dataset_dict['train'] = dataset
+        dataset_dict['train'] = get_kernel_samples(dataset)
     elif FLAGS.test_kernels is not None:
         dataset_dict = split_train_test_kernel(dataset)
 
@@ -190,6 +271,42 @@ def update_csv_dict(csv_dict, data, i, target_name, target_value, out_value):
                 csv_dict['header'] = l
 
 
+def _print_sanity_rows(csv_dict, n=10):
+    if csv_dict is None or n <= 0:
+        return
+
+    rows = []
+    for k, v in csv_dict.items():
+        if k == 'header':
+            continue
+
+        rows.append({
+            'gname': v.get('gname'),
+            'pragma': v.get('pragma'),
+            'actual_perf': v.get('acutal-perf'),
+            'pred_perf': v.get('predicted-perf'),
+            'actual_area': v.get('acutal-area'),
+            'pred_area': v.get('predicted-area'),
+        })
+
+    if not rows:
+        saver.log_info('[sanity] no rows collected')
+        return
+
+    df = pd.DataFrame(rows).head(n).copy()
+
+    saver.log_info('[sanity] first predictions vs targets:')
+    saver.log_info(df.round(4).to_string(index=False))
+
+    pred_cols = ['pred_perf', 'pred_area']
+    has_nan = df[pred_cols].isna().any().any()
+    saver.log_info(f'[sanity] NaNs present? {has_nan}')
+    saver.log_info(
+        f"[sanity] unique pred_perf={df['pred_perf'].nunique()} | "
+        f"unique pred_area={df['pred_area'].nunique()}"
+    )
+
+
 def train_main(dataset, pragma_dim = None, val_ratio=FLAGS.val_ratio, test_ratio=FLAGS.val_ratio, resample=-1):
     saver.info(f'Reading dataset from {SAVE_DIR}')
 
@@ -197,20 +314,36 @@ def train_main(dataset, pragma_dim = None, val_ratio=FLAGS.val_ratio, test_ratio
     num_graphs = len(dataset_dict['train'])
     r1, r2 = get_train_val_count(num_graphs, val_ratio, test_ratio)
 
-    if resample == -1:
-        li = split_dataset(dataset_dict['train'], r1, r2, dataset_test=dataset_dict['test'])
+    if FLAGS.tiny_overfit:
+        tiny_ds = dataset_dict['train']
+        li = [tiny_ds, tiny_ds, tiny_ds]
+        saver.log_info(
+            f"[tiny_overfit] using identical subset for train/val/test "
+            f"(n={len(tiny_ds)})"
+        )
     else:
-        li = split_dataset_resample(dataset_dict['train'], 1.0 - val_ratio - test_ratio, val_ratio, test_ratio, test_id=resample)
+        if resample == -1:
+            li = split_dataset(dataset_dict['train'], r1, r2, dataset_test=dataset_dict['test'])
+        else:
+            li = split_dataset_resample(
+                dataset_dict['train'],
+                1.0 - val_ratio - test_ratio,
+                val_ratio,
+                test_ratio,
+                test_id=resample
+            )
 
     train_loader, val_loader, test_loader, num_features, edge_dim = gen_dataset(li)
     model = Net(num_features, edge_dim=edge_dim, init_pragma_dict=pragma_dim).to(FLAGS.device)
     saver.log_info(f"Model first param device: {next(model.parameters()).device}")
     print(torch.cuda.get_device_name(0))
 
-    if FLAGS.model_path != None:
-        model_path = FLAGS.model_path[0] if type(FLAGS.model_path) is list else FLAGS.model_path
+    if FLAGS.load_pretrained and FLAGS.model_path is not None:
+        model_path = FLAGS.model_path[0] if isinstance(FLAGS.model_path, list) else FLAGS.model_path
         saver.info(f'loading model from {model_path}')
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu'), weights_only=False))
+        model.load_state_dict(
+            torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+        )
 
     if FLAGS.feature_extract:
         feature_extract(model, 'MLPs', FLAGS.fix_gnn_layer)
@@ -246,7 +379,7 @@ def train_main(dataset, pragma_dim = None, val_ratio=FLAGS.val_ratio, test_ratio
     gae_train_losses, gae_val_losses, gae_test_losses = [], [], []
     plot_test = False
 
-    if exists(ckpt_path):
+    if FLAGS.resume_training and exists(ckpt_path):
         st = torch.load(ckpt_path, map_location='cpu')
         model.load_state_dict(st["model"])
         model.to(FLAGS.device)
@@ -375,14 +508,37 @@ def train(epoch, model, train_loader, optimizer, lr_scheduler, warmup_scheduler)
         return 1 - correct / total_loss, {key: v / len(train_loader) for key, v in loss_dict.items()}, gae_loss, lrs
 
 
-def inference(dataset, init_pragma_dict=None, model_path=FLAGS.model_path, val_ratio=FLAGS.val_ratio, test_ratio=FLAGS.val_ratio, resample=-1, model_id=0, is_train_set=False, is_val_set=False):
+def inference(dataset, init_pragma_dict=None, model_path=FLAGS.model_path,
+              val_ratio=FLAGS.val_ratio, test_ratio=FLAGS.val_ratio,
+              resample=-1, model_id=0, is_train_set=False, is_val_set=False):
+
     dataset_dict = process_split_data(dataset)
     num_graphs = len(dataset_dict['train'])
     r1, r2 = get_train_val_count(num_graphs, val_ratio, test_ratio)
-    if resample == -1:
-        li = split_dataset(dataset_dict['train'], r1, r2, dataset_test=dataset_dict['test'])
+
+    if FLAGS.tiny_overfit:
+        tiny_ds = dataset_dict['train']
+        li = [tiny_ds, tiny_ds, tiny_ds]
+        saver.log_info(
+            f"[tiny_overfit][inference] using identical subset for train/val/test "
+            f"(n={len(tiny_ds)})"
+        )
     else:
-        li = split_dataset_resample(dataset, 1.0 - val_ratio - test_ratio, val_ratio, test_ratio, test_id=resample)
+        if resample == -1:
+            li = split_dataset(
+                dataset_dict['train'],
+                r1,
+                r2,
+                dataset_test=dataset_dict['test']
+            )
+        else:
+            li = split_dataset_resample(
+                dataset_dict['train'],
+                1.0 - val_ratio - test_ratio,
+                val_ratio,
+                test_ratio,
+                test_id=resample
+            )
 
     train_loader, val_loader, test_loader, num_features, edge_dim = gen_dataset(li)
     test_set = test_loader
@@ -397,24 +553,43 @@ def inference(dataset, init_pragma_dict=None, model_path=FLAGS.model_path, val_r
         init_pragma_dict = {'all': [1, 21]}
     model = Net(num_features, edge_dim=edge_dim, init_pragma_dict=init_pragma_dict).to(FLAGS.device)
 
-    if model_path != None:
+    if model_path is not None:
         saver.info(f'loading model from {model_path}')
-        model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+        state = torch.load(model_path, map_location=torch.device('cpu'), weights_only=False)
+        if isinstance(state, dict) and 'model' in state:
+            state = state['model']
+        model.load_state_dict(state)
         shutil.copy(model_path, join(saver.logdir, f"{(basename(model_path)).split('.')[0]}-{model_id}.pth"))
     else:
-        saver.error(f'model path should be set during inference')
+        saver.error('model path should be set during inference')
         raise RuntimeError()
 
     if model_id == 0:
         saver.log_model_architecture(model)
+
     data_list = []
 
     if FLAGS.task == 'regression':
-        csv_dict = {'header' : ['gname', 'pragma']}
-        test_loss, loss_dict, gae_loss, MSE_loss = test(test_set, 'test', model, 0, plot_test = True, csv_dict = csv_dict, data_list =data_list, is_train_set=is_train_set, is_val_set=is_val_set)
+        csv_dict = {'header': ['gname', 'pragma']}
+        test_loss, loss_dict, gae_loss, MSE_loss = test(
+            test_set,
+            'test',
+            model,
+            0,
+            plot_test=True,
+            csv_dict=csv_dict,
+            data_list=data_list,
+            is_train_set=is_train_set,
+            is_val_set=is_val_set
+        )
+
         loss_dict = {k: round(v, 4) for k, v in loss_dict.items()}
-        saver.log_info((f'{loss_dict}'))
-        saver.log_info(('Test loss: {:.7f}, MSE loss: {:.7f}'.format(test_loss, MSE_loss)))
+        saver.log_info(f'{loss_dict}')
+        saver.log_info('Test loss: {:.7f}, MSE loss: {:.7f}'.format(test_loss, MSE_loss))
+
+        if FLAGS.sanity_print_n > 0:
+            _print_sanity_rows(csv_dict, FLAGS.sanity_print_n)
+
         saver.log_dict_of_dicts_to_csv(f'actual-prediction-{model_id}', csv_dict, csv_dict['header'])
         print(len(data_list), 'out of', len(test_loader))
     else:

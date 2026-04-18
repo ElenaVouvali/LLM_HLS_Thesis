@@ -187,7 +187,7 @@ class Net(nn.Module):
     def node_att_gate_nn(self, D):  # constructs a tiny MLP, the gate network that computes a scalar score per node from a node’s embedding (size D)
           if FLAGS.node_attention_MLP:
               return MLP(D, 1,
-                      activation_type=FLAGS.activation_type,
+                      activation_type=FLAGS.activation,
                       hidden_channels=[D // 2, D // 4, D // 8],
                       num_hidden_lyr=3)
           else:
@@ -201,12 +201,66 @@ class Net(nn.Module):
           gae_loss = self.gae_loss_function(encoded_g, decoded_out, target)
           return gae_loss
 
-    def mask_emb(self, out, non_zero_ids):
-          out = out.permute((1, 0))
-          out = out * non_zero_ids  # non_zero_ids : [N, 1] --> 1.0 for nodes in scope and 0.0 otherwise
-          out = out.permute((1, 0))
+    def _normalize_scope_mask(self, mask, ref_tensor):
+        """
+        Ensure scope mask is [N, 1], on the same device/dtype as ref_tensor.
+        ref_tensor is expected to be [N, F].
+        """
+        if mask.dim() == 1:
+            mask = mask.unsqueeze(-1)
+        elif mask.dim() == 2 and mask.size(1) == 1:
+            pass
+        else:
+            raise RuntimeError(
+                f"Scope mask must be [N] or [N,1], got shape={tuple(mask.shape)}"
+            )
 
-          return out  # [N, D]
+        if mask.size(0) != ref_tensor.size(0):
+            raise RuntimeError(
+                f"Scope mask/node count mismatch: mask={tuple(mask.shape)} "
+                f"ref_tensor={tuple(ref_tensor.shape)}"
+            )
+
+        return mask.to(device=ref_tensor.device, dtype=ref_tensor.dtype)
+
+
+    def _get_scope_nodes(self, data, ref_tensor, kind):
+        """
+        Use the correct scope mask for each pragma kind.
+        """
+        if kind == "pipeline":
+            return self._normalize_scope_mask(data.X_pipeline_scopeids, ref_tensor)
+        elif kind == "unroll":
+            return self._normalize_scope_mask(data.X_unroll_scopeids, ref_tensor)
+        elif kind == "array_partition":
+            return self._normalize_scope_mask(data.X_array_partition_scopeids, ref_tensor)
+        elif kind == "merge":
+            masks = []
+            if "pipeline" in self.pragma_as_MLP_list:
+                masks.append(self._normalize_scope_mask(data.X_pipeline_scopeids, ref_tensor))
+            if "unroll" in self.pragma_as_MLP_list:
+                masks.append(self._normalize_scope_mask(data.X_unroll_scopeids, ref_tensor))
+            if "array_partition" in self.pragma_as_MLP_list:
+                masks.append(self._normalize_scope_mask(data.X_array_partition_scopeids, ref_tensor))
+
+            if not masks:
+                raise RuntimeError("No pragma masks found for merge step.")
+
+            scope = masks[0]
+            for m in masks[1:]:
+                scope = torch.maximum(scope, m)
+            return scope
+        else:
+            raise NotImplementedError(f"Unknown pragma kind {kind}")
+
+
+    def mask_emb(self, out, non_zero_ids):
+        """
+        out: [N, F]
+        non_zero_ids: [N] or [N,1]
+        """
+        mask = self._normalize_scope_mask(non_zero_ids, out)
+        return out * mask
 
     def apply_pragma_mlp(self, mlp_pragma, node_emb, scope_nodes, pragma_tensor, kind):
           """
@@ -217,7 +271,8 @@ class Net(nn.Module):
             - if kind == 'merge': concatenated per-pragma outputs [N, D*len(pragmas)]
           scope_nodes: [N,1] (1.0 for nodes in scope, 0.0 otherwise)
           """
-          non_scope_nodes = torch.sub(1, scope_nodes)
+          scope_nodes = self._normalize_scope_mask(scope_nodes, node_emb)
+          non_scope_nodes = 1.0 - scope_nodes
 
           if kind == 'merge':
               # mlp over the concatenated per-pragma outputs, only at scoped nodes
@@ -248,6 +303,41 @@ class Net(nn.Module):
               return self.mask_emb(mlp_out, non_zero_ids=scope_nodes)
           else:
               raise NotImplementedError()
+          
+
+    def _normalize_debug_tensors(self, data):
+        # scope masks should be [N,1] float
+        for name in [
+            'X_contextnids',
+            'X_pragmanids',
+            'X_pragmascopenids',
+            'X_pseudonids',
+            'X_arrayscopenids',
+            'X_pipeline_scopeids',
+            'X_unroll_scopeids',
+            'X_array_partition_scopeids',
+            'X_scopenids',
+            'X_icmpnids',
+        ]:
+            if hasattr(data, name):
+                x = getattr(data, name)
+                if x.dim() == 2 and x.size(1) == 1:
+                    x = x.squeeze(1)
+                setattr(data, name, x.float())
+
+        if hasattr(data, 'X_pragma_per_node'):
+            if data.X_pragma_per_node.dtype != torch.float32:
+                data.X_pragma_per_node = data.X_pragma_per_node.float()
+            assert data.X_pragma_per_node.dim() == 2, \
+                f"Expected X_pragma_per_node to be [N,5], got {tuple(data.X_pragma_per_node.shape)}"
+            assert data.X_pragma_per_node.size(1) == 5, \
+                f"Expected X_pragma_per_node last dim = 5, got {tuple(data.X_pragma_per_node.shape)}"
+
+        if hasattr(data, 'pragmas'):
+            if data.pragmas.dtype != torch.float32:
+                data.pragmas = data.pragmas.float()
+
+        return data
 
 
     '''
@@ -256,6 +346,7 @@ class Net(nn.Module):
     encoder-only: returns just the pooled graph representation
     '''
     def _graph_embed(self, data):
+          data = self._normalize_debug_tensors(data)
           # x : [N, in_channels] = [N, num_features] = [N, F] --> node features (one-hot encoded)
           # edge_index : [2, E] = [2, no_of_edges] (the 2 rows hold source and destination node indices for each edge) --> graph structure
           # edge_attr : [E, edge_dim] --> one feature vector per edge
@@ -306,12 +397,15 @@ class Net(nn.Module):
               assert X_pragma_per_node.size(-1) == 5, \
                   f"X_pragma_per_node must be [...,5] ([PIPE_II, UNROLL_FACTOR, PARTITION_TYPE, PARTITION_FACTOR, PARTITION_DIM]), got {tuple(X_pragma_per_node.size())}"
               in_merge = None
-              for kind in self.pragma_as_MLP_list:  # ['pipeline','unroll']
-                  # concatenating node embedding [N,D] with the one scalar option (II / FACTOR) --> [N, D+1]
-                  # mask to only pragma-scope nodes (X_pragmascopenids) --> tiny MLP --> updated node embedding [N, D]
-                  out_MLP = self.apply_pragma_mlp(self.MLPs_per_pragma[kind],
-                                                  out, data.X_pragmascopenids,
-                                                  X_pragma_per_node, kind)
+              for kind in self.pragma_as_MLP_list:
+                  scope_nodes = self._get_scope_nodes(data, out, kind)
+                  out_MLP = self.apply_pragma_mlp(
+                      self.MLPs_per_pragma[kind],
+                      out,
+                      scope_nodes,
+                      X_pragma_per_node,
+                      kind,
+                    )
                   if FLAGS.pragma_order == 'sequential':
                       out = out_MLP
                   elif FLAGS.pragma_order == 'parallel_and_merge':
@@ -321,9 +415,14 @@ class Net(nn.Module):
 
               if FLAGS.pragma_order == 'parallel_and_merge':
                   # concatenation of both per-pragma outputs [N, 2D] --> merge MLP --> updated node embedding [N, D]
-                  out = self.apply_pragma_mlp(self.MLPs_per_pragma['merge'],
-                                              out, data.X_pragmascopenids,
-                                              in_merge, 'merge')
+                  merge_scope = self._get_scope_nodes(data, out, "merge")
+                  out = self.apply_pragma_mlp(
+                      self.MLPs_per_pragma['merge'],
+                      out,
+                      merge_scope,
+                      in_merge,
+                      'merge',
+                      )
 
               # post-pragma extra conv layers
               # 1 conv layer after the pragma MLPs to let the network diffuse the local pragma effects through the graph
@@ -397,6 +496,7 @@ class Net(nn.Module):
     Runs the same way as the forward function up to the final node embeddings representation (out_node_embed)
     '''
     def _node_embed(self, data):
+          data = self._normalize_debug_tensors(data)
           # x : [N, in_channels] = [N, num_features] = [N, F] --> node features (one-hot encoded)
           # edge_index : [2, E] = [2, no_of_edges] (the 2 rows hold source and destination node indices for each edge) --> graph structure
           # edge_attr : [E, edge_dim] --> one feature vector per edge
@@ -446,10 +546,15 @@ class Net(nn.Module):
               assert X_pragma_per_node.size(-1) == 5, \
                   f"X_pragma_per_node must be [...,5] ([PIPE_II, UNROLL_FACTOR, PARTITION_TYPE, PARTITION_FACTOR, PARTITION_DIM]), got {tuple(X_pragma_per_node.size())}"
               in_merge = None
-              for kind in self.pragma_as_MLP_list:  # ['pipeline','unroll']
-                  out_MLP = self.apply_pragma_mlp(self.MLPs_per_pragma[kind],
-                                                  out, data.X_pragmascopenids,
-                                                  X_pragma_per_node, kind)
+              for kind in self.pragma_as_MLP_list:
+                  scope_nodes = self._get_scope_nodes(data, out, kind)
+                  out_MLP = self.apply_pragma_mlp(
+                      self.MLPs_per_pragma[kind],
+                      out,
+                      scope_nodes,
+                      X_pragma_per_node,
+                      kind,
+                      )
                   if FLAGS.pragma_order == 'sequential':
                       out = out_MLP
                   elif FLAGS.pragma_order == 'parallel_and_merge':
@@ -459,9 +564,14 @@ class Net(nn.Module):
 
               if FLAGS.pragma_order == 'parallel_and_merge':
                  # merge the two streams back to D using 'merge' MLP
-                  out = self.apply_pragma_mlp(self.MLPs_per_pragma['merge'],
-                                              out, data.X_pragmascopenids,
-                                              in_merge, 'merge')
+                  merge_scope = self._get_scope_nodes(data, out, "merge")
+                  out = self.apply_pragma_mlp(
+                      self.MLPs_per_pragma['merge'],
+                      out,
+                      merge_scope,
+                      in_merge,
+                      'merge',
+                      )
 
               for i, conv in enumerate(self.conv_layers[self.num_conv_layers:]):
                   if FLAGS.encode_edge and  FLAGS.gnn_type == 'transformer':
@@ -491,6 +601,7 @@ class Net(nn.Module):
     end-to-end model: produces predictions and losses (regression/classification), optionally adds auxiliary GAE losses, and is the function used during training
     '''
     def forward(self, data):
+        data = self._normalize_debug_tensors(data)
         x, edge_index, edge_attr, batch = \
             data.x, data.edge_index, data.edge_attr, data.batch
         pragmas = getattr(data, "pragmas", None)
@@ -536,10 +647,15 @@ class Net(nn.Module):
             assert X_pragma_per_node.size(-1) == 5, \
                   f"X_pragma_per_node must be [...,5] ([PIPE_II, UNROLL_FACTOR, PARTITION_TYPE, PARTITION_FACTOR, PARTITION_DIM]), got {tuple(X_pragma_per_node.size())}"
             in_merge = None
-            for kind in self.pragma_as_MLP_list:  # ['pipeline','unroll']
-                out_MLP = self.apply_pragma_mlp(self.MLPs_per_pragma[kind],
-                                                out, data.X_pragmascopenids,
-                                                X_pragma_per_node, kind)
+            for kind in self.pragma_as_MLP_list:
+                scope_nodes = self._get_scope_nodes(data, out, kind)
+                out_MLP = self.apply_pragma_mlp(
+                    self.MLPs_per_pragma[kind],
+                    out,
+                    scope_nodes,
+                    X_pragma_per_node,
+                    kind,
+                    )
                 if FLAGS.pragma_order == 'sequential':
                     out = out_MLP
                 elif FLAGS.pragma_order == 'parallel_and_merge':
@@ -549,9 +665,14 @@ class Net(nn.Module):
 
             if FLAGS.pragma_order == 'parallel_and_merge':
                 # merge the two streams back to D using 'merge' MLP
-                out = self.apply_pragma_mlp(self.MLPs_per_pragma['merge'],
-                                            out, data.X_pragmascopenids,
-                                            in_merge, 'merge')
+                merge_scope = self._get_scope_nodes(data, out, "merge")
+                out = self.apply_pragma_mlp(
+                    self.MLPs_per_pragma['merge'],
+                    out,
+                    merge_scope,
+                    in_merge,
+                    'merge',
+                )
 
             for i, conv in enumerate(self.conv_layers[self.num_conv_layers:]):
                 if FLAGS.encode_edge and  FLAGS.gnn_type == 'transformer':

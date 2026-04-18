@@ -138,135 +138,6 @@ def print_weight_stats(kernel_csv_name, w):
         print(f"  p{int(q*100):2d}: {np.quantile(w, q):.3f}")
 
 
-
-def preprocess_csv(csv_file):
-    df = pd.read_csv(csv_file)
-
-    # 1) Filter by device & clock
-    df_device = df[
-        (df['Device'] == 'xczu7ev-ffvc1156-2-e')
-        & (df['Clock_Period_nsec'] == 10.00)
-    ].copy()
-    df_device.drop(columns=['Device', 'Clock_Period_nsec'], inplace=True)
-
-    # 2) Drop empty columns
-    nonempty_cols = [col for col in df_device.columns if all(df_device[col] != 'NDIR')]
-    df_filter = df_device[nonempty_cols].copy()
-
-    utilization_cols = [
-        'BRAM_Utilization_percentage',
-        'DSP_Utilization_percentage',
-        'FF_Utilization_percentage',
-        'LUT_Utilization_percentage',
-    ]
-
-    # Invalidate over-utilized or absurdly slow designs
-    overutil_mask = (df_filter[utilization_cols] >= 100).any(axis=1)
-    too_slow_mask = df_filter['Latency_msec'] > 100000
-    df_filter.loc[overutil_mask | too_slow_mask, 'Latency_msec'] = 0
-
-    # Replace 0% with 1% to avoid zero-area designs
-    df_filter[utilization_cols] = df_filter[utilization_cols].replace(0, 1)
-
-    # Area = average utilization
-    df_filter['Area'] = df_filter[utilization_cols].sum(axis=1) / 4.0
-
-    # Keep only valid designs (Latency_msec > 0)
-    valid_mask = df_filter['Latency_msec'] > 0
-    df_valid = df_filter[valid_mask].copy()
-
-    if df_valid.empty:
-        print(f"No valid designs in {csv_file} after filtering.")
-        return
-
-    # Build normalized perf/area 
-    perf = df_valid['Latency_msec'].to_numpy()
-    area = df_valid['Area'].to_numpy()
-
-    eps = 1e-8
-    perf_min, perf_max = perf.min(), perf.max()
-    area_min, area_max = area.min(), area.max()
-    perf_n = (perf - perf_min) / (perf_max - perf_min + eps)
-    area_n = (area - area_min) / (area_max - area_min + eps)
-
-    # Pareto frontier 
-    pareto_mask = pareto_front_2d(perf_n, area_n)
-
-    perf_p = perf_n[pareto_mask]
-    area_p = area_n[pareto_mask]
-
-    # Sort Pareto points by performance (x-axis) for a consistent front
-    order = np.argsort(perf_p)
-    perf_p = perf_p[order]
-    area_p = area_p[order]
-
-    # t[0] = 0, t[i] = cumulative Euclidean distance along frontier
-    dx = np.diff(perf_p)
-    dy = np.diff(area_p)
-    seg_len = np.sqrt(dx**2 + dy**2)
-    t = np.concatenate([[0.0], np.cumsum(seg_len)])  # shape [P]
-
-    if t[-1] > 0:
-        t_norm = t / t[-1]
-    else:
-        t_norm = np.zeros_like(t)
-
-    # "Center" of the front (we want to favor Pareto-like points near here)
-    t_center = np.median(t_norm)
-
-    # Distances for each design point
-    P = perf_p.shape[0]
-    d_perp = np.empty_like(perf_n)
-    d_along = np.empty_like(perf_n)
-
-    for i in range(len(perf_n)):
-        # distances from this point to all Pareto points
-        dx_i = perf_n[i] - perf_p
-        dy_i = area_n[i] - area_p
-        dist_i = np.sqrt(dx_i**2 + dy_i**2)  # [P]
-
-        j = np.argmin(dist_i)       # index of closest Pareto point
-        d_perp[i] = dist_i[j]       # perpendicular distance
-        d_along[i] = abs(t_norm[j] - t_center)  # how far along the front from the center
-
-    # Combine distances:
-    #  - d_perp: pushes all points toward the frontier
-    #  - d_along: penalizes extreme Pareto regions (both very high-area and very slow)
-    alpha = 0.7  # weight for perpendicular distance vs along-front distance
-    d_combined = alpha * d_perp + (1.0 - alpha) * d_along
-
-    # Map combined distance to weights in [w_min, 1] 
-    # Shift so the best point has distance 0
-    d_shifted = d_combined - d_combined.min()
-    d_max = d_shifted.max() + eps
-    d_norm = d_shifted / d_max  # 0 = best, 1 = worst
-
-    gamma = 2.0
-    w_min_valid = 0.1
-    w_valid = w_min_valid + (1.0 - w_min_valid) * (1.0 - d_norm) ** gamma
-
-    # Attach to df_valid
-    df_valid['Weight'] = w_valid
-
-    # Re-map pareto_mask (which is over df_valid rows) directly
-    df_valid['is_pareto'] = pareto_mask
-
-    # Print weight stats for sanity check 
-    base_name = os.path.basename(csv_file)
-    print_weight_stats(base_name, w_valid)
-
-
-    filename = os.path.basename(csv_file)
-    out_path = os.path.join(
-        os.path.expanduser('/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS'),
-        f'preprocessed-{filename}',
-    )
-    df_valid.to_csv(out_path, index=False)
-    print(f"Saved preprocessed CSV to: {out_path}")
-
-
-
-
 def preprocess_csv(csv_file,
                    out_dir=os.path.expanduser('/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS'),
                    w_min_valid=0.1,
@@ -500,7 +371,6 @@ def plot_pareto_for_kernel(
     print(f"Saved Pareto plot to: {out_path}")
 
 
-
 def plot_pareto_for_kernel_LLM_pred(
     csv_file,
     output_dir=os.path.expanduser('/home/elvouvali/Data4LLMPrompting/pareto_per_kernel'),
@@ -596,30 +466,33 @@ def plot_pareto_for_kernel_LLM_pred(
     print(f"Pareto plot with LLM prediction saved to: {out_path}")
 
 
+def main():
+    in_dir = "/home/ubuntu/Data4LLMPrompting/CSVS"
+    out_dir = "/home/ubuntu/Data4LLMPrompting/preprocessed_CSVS"
 
-# XATTN
-plot_pareto_for_kernel_LLM_pred(
-    '/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS/preprocessed-rodinia-kmeans-2-pipeline.csv',
-    llm_latency_msec=36912,
-    llm_bram_pct=42,
-    llm_dsp_pct=0,
-    llm_ff_pct=16,
-    llm_lut_pct=30,
-)
+    os.makedirs(out_dir, exist_ok=True)
+
+    csv_files = sorted(glob.glob(os.path.join(in_dir, "*.csv")))
+    print(f"Found {len(csv_files)} CSV files in {in_dir}")
+
+    ok = 0
+    failed = 0
+
+    for i, csv_file in enumerate(csv_files, start=1):
+        name = os.path.basename(csv_file)
+        print(f"\n[{i}/{len(csv_files)}] Processing {name}")
+        try:
+            preprocess_csv(csv_file, out_dir=out_dir)
+            ok += 1
+        except Exception as e:
+            failed += 1
+            print(f"[FAIL] {name}: {e}")
+
+    print("\nDone.")
+    print(f"Processed successfully: {ok}")
+    print(f"Failed: {failed}")
+    print(f"Output directory: {out_dir}")
 
 
-# BASE
-#plot_pareto_for_kernel_LLM_pred(
-#    '/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS/preprocessed-rodinia-kmeans-2-pipeline.csv',
-#    llm_latency_msec=35492,
-#    llm_bram_pct=42,
-#    llm_dsp_pct=0,
-#    llm_ff_pct=3,
-#    llm_lut_pct=8,
-#)
-
-# preprocess_csv('/home/elvouvali/Data4LLMPrompting/CSVS/spcl_example_00.csv')
-# plot_pareto_for_kernel(csv_file='/home/elvouvali/Data4LLMPrompting/preprocessed_CSVS/preprocessed-spcl_example_00.csv')
-
-
-
+if __name__ == "__main__":
+    main()

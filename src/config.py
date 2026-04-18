@@ -21,7 +21,7 @@ parser.add_argument('--task', default=TASK)
 
 # SUBTASK = 'dse'
 # SUBTASK = 'inference'
-SUBTASK = 'inference'
+SUBTASK = 'train'
 parser.add_argument('--subtask', default=SUBTASK)
 parser.add_argument('--plot_dse', default=False)
 
@@ -123,8 +123,9 @@ else:
 
 ################# one-hot encoder ##################
 encoder_path = None
+pragma_dim_path = None
 encode_edge_position = True
-use_encoder = True
+use_encoder = False
 if use_encoder:
     encoder_path_list = [f for f in iglob(join(get_root_path(), 'save', 'harp', 'all_kernels', '**'), recursive=True) if f.endswith('.klepto') and 'encoders' in f]
     pragma_dim_path_list = [f for f in iglob(join(get_root_path(), 'save', 'harp', 'all_kernels', '**'), recursive=True) if f.endswith('.klepto') and 'pragma_dim' in f]
@@ -206,7 +207,7 @@ parser.add_argument('--merge_MLP_hidden_channels', default=merge_MLP_hidden_chan
 
 model_path = None
 model_path_list = ['/home/ubuntu/val_model_state_dict.pth']
-use_pretrain = True
+use_pretrain = False
 if use_pretrain:
     #base_path = 'models'
     #keyword =  v_db
@@ -252,17 +253,21 @@ val_ratio = 0.05    # 0.15
 parser.add_argument('--resample', default=resample) ## when resample is turned on, it will divide the dataset in round-robin and train multiple times to have all the points in train/test set
 parser.add_argument('--val_ratio', type=float, default=val_ratio) # ratio of database for validation set
 parser.add_argument('--activation', default='elu')
-parser.add_argument('--D', type=int, default=32)    # 64
-parser.add_argument('--lr', default=0.001)
-scheduler, warmup, weight_decay = None, None, 0
+parser.add_argument('--D', type=int, default=64)    
 scheduler, warmup, weight_decay = 'cosine', 'linear', 1e-4
-parser.add_argument('--weight_decay', default=weight_decay) ## default=0.0001, larger than 1e-4 didn't help original graph P+T
+parser.add_argument('--weight_decay', type=float, default=weight_decay) ## default=0.0001, larger than 1e-4 didn't help original graph P+T
 parser.add_argument("--scheduler", default=scheduler)
 parser.add_argument("--warmup", default=warmup)
+parser.add_argument('--lr', type=float, default=0.001)
 
-parser.add_argument('--random_seed', default=123) ## default=100
-batch_size = 96 # 64
+parser.add_argument('--random_seed', type=int, default=123)
+batch_size = 64
 parser.add_argument('--batch_size', type=int, default=batch_size)
+
+parser.add_argument('--num_workers', type=int, default=0)
+parser.add_argument('--eval_num_workers', type=int, default=0)
+parser.add_argument('--prefetch_factor', type=int, default=1)
+parser.add_argument('--persistent_workers', action='store_true')
 
 loss = 'MSE' # RMSE, MSE,
 parser.add_argument('--loss', type=str, default=loss)
@@ -276,12 +281,23 @@ else:
     epoch_num = 400
 
 parser.add_argument('--epoch_num', type=int, default=epoch_num)
+parser.add_argument('--sanity_print_n', type=int, default=0)
 
 gpu = 0
 device = str('cuda:{}'.format(gpu) if torch.cuda.is_available() and gpu != -1
              else 'cpu')
 parser.add_argument('--device', default=device)
 
+
+################ tiny overfit debug ################
+parser.add_argument('--tiny_overfit', action='store_true')
+parser.add_argument('--tiny_overfit_kernel', type=str, default='machsuite-gemm-blocked')
+parser.add_argument('--tiny_overfit_num_samples', type=int, default=64)
+parser.add_argument('--tiny_overfit_batch_size', type=int, default=16)
+parser.add_argument('--tiny_overfit_epochs', type=int, default=300)
+parser.add_argument('--tiny_overfit_workers', type=int, default=0)
+parser.add_argument('--resume_training', action='store_true')
+parser.add_argument('--load_pretrained', action='store_true')
 
 
 ################# DSE details ##################
@@ -306,4 +322,30 @@ parser.add_argument('--user', default=get_user())
 
 parser.add_argument('--hostname', default=get_host())
 
-FLAGS = parser.parse_args([])
+# FLAGS = parser.parse_args([])
+
+FLAGS = parser.parse_args()
+
+if FLAGS.tiny_overfit:
+    FLAGS.force_regen = False
+    FLAGS.target_kernel = FLAGS.tiny_overfit_kernel
+    FLAGS.all_kernels = False
+
+    FLAGS.batch_size = FLAGS.tiny_overfit_batch_size
+    FLAGS.epoch_num = FLAGS.tiny_overfit_epochs
+
+    FLAGS.val_ratio = 0.0
+    FLAGS.dropout = 0.0
+    FLAGS.weight_decay = 0.0
+    FLAGS.scheduler = None
+    FLAGS.warmup = None
+
+    # Important:
+    # keep model_path during inference sanity-check,
+    # but disable pretrained loading during training tiny-overfit runs
+    if FLAGS.subtask == 'train':
+        FLAGS.model_path = None
+
+    FLAGS.save_model = True
+    FLAGS.model_tag = f"tiny_overfit_{FLAGS.tiny_overfit_kernel}"
+
