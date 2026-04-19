@@ -16,17 +16,49 @@ def _normalize_kernel_name(s: str) -> str:
     return re.sub(r"[-\s]+", "_", s.strip().lower())    # match both '-' and '_'
 
 
+def _disable_pragma_conditioning(data):
+    """
+    Disable all pragma-conditioned updates used by the fixed NPT path.
+    """
+    for name in (
+        "X_pragmascopenids",
+        "X_pipeline_scopeids",
+        "X_unroll_scopeids",
+        "X_array_partition_scopeids",
+    ):
+        if hasattr(data, name):
+            setattr(data, name, torch.zeros_like(getattr(data, name)))
+
+    # Extra safety: neutralize value tensors too
+    if hasattr(data, "X_pragma_per_node"):
+        data.X_pragma_per_node = torch.zeros_like(data.X_pragma_per_node)
+    if hasattr(data, "pragmas"):
+        data.pragmas = torch.zeros_like(data.pragmas)
+
+    return data
+
 
 @torch.no_grad()
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--pt_path", default="/home/elvouvali/save/harp/pragma-free_kernels")
-    ap.add_argument("--ckpt", default="/home/elvouvali/logs/all_kernels_GNN_train/run1/val_model_state_dict.pth")
-    ap.add_argument("--out", default="/home/elvouvali/save/harp/memory_tokens")
+    ap.add_argument("--pt_path", default="/home/ubuntu/save/harp/pragma-free_kernels")
+    ap.add_argument("--ckpt", default="/home/ubuntu/logs/all_kernels_GNN_train/run1/val_model_state_dict.pth")
+    ap.add_argument("--out", default="/home/ubuntu/save/harp/memory_tokens")
 
     # Leakage control
-    ap.add_argument("--disable_pragma_injection", action="store_true",
-                    help="Recommended: set X_pragmascopenids=0 before running the GNN (pure-structure embeddings).")
+    ap.add_argument(
+        "--disable_pragma_injection",
+        dest="disable_pragma_injection",
+        action="store_true",
+        help="Build pure-structure memory (recommended default)."
+    )
+    ap.add_argument(
+        "--allow_pragma_injection",
+        dest="disable_pragma_injection",
+        action="store_false",
+        help="Allow pragma-conditioned NPT updates during memory extraction."
+    )
+    ap.set_defaults(disable_pragma_injection=True)
 
     ap.add_argument("--max_slots", type=int, default=64)
     args = ap.parse_args()
@@ -65,21 +97,29 @@ def main():
 
         try:
             pt_point = load_and_clean_graph(kernel_path)
+
+            required = [
+                "X_pipeline_scopeids",
+                "X_unroll_scopeids",
+                "X_array_partition_scopeids",
+                "X_arrayscopenids",
+                "X_llm_scopeids",
+                "X_llm_scopecat",
+                "X_llm_labelid",
+            ]
+            missing = [k for k in required if not hasattr(pt_point, k)]
+            if missing:
+                raise RuntimeError(
+                    f"{fname} is missing required fields {missing}. "
+                    "Regenerate pragma-free .pt files with the patched gexf_to_pt_zero.py."
+                )
+
             batch = Batch.from_data_list([pt_point]).to(FLAGS.device)
 
-            graph_embed = model.forward_embed(batch)
-
-            # if hasattr(batch, "X_pragmascopenids"):
-            #     scope_mask_orig = (batch.X_pragmascopenids > 0.5).detach().clone()
-            # else:
-            #     print(f"Skipping {fname}: Missing X_pragmascopenids")
-            #     continue
-
-            # disable pragma injection by zeroing the scope mask used by apply_pragma_mlp() 
-            # => prevent any pragma-conditioned updates inside the GNN
             if args.disable_pragma_injection:
-                batch.X_pragmascopenids = torch.zeros_like(batch.X_pragmascopenids)
+                batch = _disable_pragma_conditioning(batch)
 
+            graph_embed = model.forward_embed(batch)
             node_emb = model.forward_node_embed(batch)
 
 #            # Use X_llm_scopeids and X_llm_labelid to build slot-aligned memory
@@ -93,6 +133,7 @@ def main():
             # slot-aligned outputs
             node_embs = torch.zeros((args.max_slots, node_emb.size(-1)), dtype=node_emb.dtype, device=node_emb.device)
             node_embs_mask = torch.zeros((args.max_slots,), dtype=torch.bool, device=node_emb.device)
+            slot_cats = torch.zeros((args.max_slots,), dtype=torch.long, device=node_emb.device)
 
             node_ids = [-1] * args.max_slots
             labels = [-1] * args.max_slots
@@ -104,6 +145,7 @@ def main():
                 node_embs_mask[slot] = True
                 node_ids[slot] = ni
                 labels[slot] = lid
+                slot_cats[slot] = int(batch.X_llm_scopecat[ni].item())
 
             node_embs = node_embs.detach().cpu()
             node_embs_mask = node_embs_mask.detach().cpu()
@@ -126,9 +168,10 @@ def main():
                 "graph_embed": graph_embed,
                 "max_slots": args.max_slots,
                 "slot_ids": torch.arange(1, args.max_slots + 1, dtype=torch.long),
+                "slot_cats": slot_cats.detach().cpu(),
                 "node_ids": node_ids,
-                "labels": labels
-                }
+                "labels": labels,
+            }
 
             torch.save(pack, output_path)
             print(f"[OK] {fname} -> Node embeddings shape : {node_embs.shape}")

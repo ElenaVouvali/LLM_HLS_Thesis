@@ -230,160 +230,93 @@ def _fill_targets_like_data_py(xy_dict: Dict[str, Any], perf_val: float, area_va
     xy_dict["actual_area"] = torch.FloatTensor(np.array([area_safe], dtype=np.float32))
 
 
-
-def _as_int(x: Any, default: int = -1) -> int:
-    try:
-        return int(x)
-    except Exception:
-        return default
-
-
-def _extract_label_id_from_full_text(ft: Any) -> int:
-    """
-    Extract label id from strings like:
-      "... auto{_PIPE_L3} ..." or "... auto{_ARRAY_T_L7} ..."
-    Returns integer (e.g., 3, 7) or -1 if not found.
-    """
+def _extract_label_ids_from_full_text(ft: Any) -> List[int]:
     if not isinstance(ft, str):
-        return -1
-    # try direct pattern first
-    m = _LABEL_RE.search(ft)
-    if m:
-        try:
-            return int(m.group(1))
-        except Exception:
-            return -1
-    for key in _AUTO_RE.findall(ft):
-        mm = _LABEL_RE.search(key)
-        if mm:
-            try:
-                return int(mm.group(1))
-            except Exception:
-                return -1
-    return -1
+        return []
 
+    lids = set()
+
+    for key in _AUTO_RE.findall(ft):
+        if key.startswith(_ALLOWED_PREFIXES):
+            m = _LABEL_RE.search(key)
+            if m:
+                lids.add(int(m.group(1)))
+
+    if not lids:
+        for m in _LABEL_RE.finditer(ft):
+            lids.add(int(m.group(1)))
+
+    return sorted(lids)
 
 
 def _build_llm_scope_tensors(g: nx.Graph) -> Dict[str, torch.Tensor]:
     """
-    Build per-node masks for LLM memory anchors.
+    Build slot-anchor tensors aligned with the fixed data.py scope semantics:
 
-      - Loop pragmas (PIPELINE / UNROLL): anchor on the pseudo-block scope node
-      - Array pragmas (ARRAY_PARTITION): anchor on the pragma node itself
+      - loop pragmas: anchor on pseudo-block scope nodes
+      - array_partition pragmas: anchor on array-scope nodes (type=104)
 
+    One anchor node -> one source label Lk.
     """
     N = g.number_of_nodes()
     scopeids = torch.zeros((N,), dtype=torch.long)
-    scopecat = torch.zeros((N,), dtype=torch.long)   # 0 none, 1 loop-scope pseudo, 2 array-pragma node
+    scopecat = torch.zeros((N,), dtype=torch.long)   # 0 none, 1 pseudo-loop-scope, 2 array-scope
     label_ids = torch.full((N,), -1, dtype=torch.long)
 
-    def _extract_label_ids_from_full_text(ft: Any) -> List[int]:
-
-        if not isinstance(ft, str):
-            return []
-
-        lids = set()
-
-        # scan actual auto{...} placeholders and keep only allowed prefixes
-        for key in _AUTO_RE.findall(ft):
-            if key.startswith(_ALLOWED_PREFIXES):
-                m = _LABEL_RE.search(key)
-                if m:
-                    lids.add(int(m.group(1)))
-
-        # Fallback: if nothing found, scan whole text for Lk labels
-        if not lids:
-            for m in _LABEL_RE.finditer(ft):
-                lids.add(int(m.group(1)))
-
-        return sorted(lids)
-
-    # Deterministic map: (block, function) -> pseudo node id
-    # Keep the smallest nid if multiple pseudo nodes share the same (block, function)
-    pseudo_by_bf = {}
-    for nid_str, ndata in g.nodes(data=True):
-        if not (isinstance(nid_str, str) and nid_str.isdigit()):
-            continue
-
-        nid = int(nid_str)
-        ntype = _as_int(ndata.get("type", -1), -1)
-        text = str(ndata.get("text", "")).lower()
-
-        if ntype == 4 or "pseudo" in text:
-            b = _as_int(ndata.get("block", -1), -1)
-            f = _as_int(ndata.get("function", -1), -1)
-            if b != -1 and f != -1:
-                prev = pseudo_by_bf.get((b, f))
-                if prev is None or nid < prev:
-                    pseudo_by_bf[(b, f)] = nid
-
-    # Collect placeholder -> anchor assignments first
-    # This avoids silent overwrites and keeps behavior deterministic.
-    assignments = []   # list of (label_id, anchor_nid, anchor_cat)
-
-    for nid_str, ndata in sorted(g.nodes(data=True), key=lambda x: int(x[0]) if str(x[0]).isdigit() else 10**18):
-        if not (isinstance(nid_str, str) and nid_str.isdigit()):
-            continue
-
-        nid = int(nid_str)
-        ntype = _as_int(ndata.get("type", -1), -1)
-        if ntype != 100:
-            continue
-
-        kind = str(ndata.get("text", "")).strip().upper()
-        ft = ndata.get("full_text", "")
-        lids = _extract_label_ids_from_full_text(ft)
-
-        if not lids:
-            continue
-
-        b = _as_int(ndata.get("block", -1), -1)
-        f = _as_int(ndata.get("function", -1), -1)
-
-        if kind in ("PIPELINE", "UNROLL"):
-            pseudo = pseudo_by_bf.get((b, f), None)
-            if pseudo is None:
-                raise RuntimeError(
-                    f"Could not find pseudo scope node for loop pragma node {nid} "
-                    f"(kind={kind}, block={b}, function={f}, full_text={ft!r})"
-                )
-            for lid in lids:
-                assignments.append((lid, pseudo, 1))
-
-        elif kind == "ARRAY_PARTITION":
-            for lid in lids:
-                assignments.append((lid, nid, 2))
-
-    # Enforce one unique anchor per label and one unique label per anchor
     label_to_anchor = {}
     anchor_to_label = {}
 
-    for lid, anchor_nid, anchor_cat in assignments:
-        # Same label appearing multiple times with different anchors is inconsistent
-        if lid in label_to_anchor:
-            prev_nid, prev_cat = label_to_anchor[lid]
-            if prev_nid != anchor_nid or prev_cat != anchor_cat:
-                raise RuntimeError(
-                    f"Placeholder L{lid} maps to multiple anchors: "
-                    f"({prev_nid}, cat={prev_cat}) and ({anchor_nid}, cat={anchor_cat})."
-                )
+    for node, ndata in sorted(g.nodes(data=True), key=lambda x: int(x[0])):
+        if data_py.is_pseudo_block_node(ndata):
+            allowed_kinds = {"pipeline", "unroll"}
+            anchor_cat = 1
+        elif data_py.is_array_scope_node(ndata):
+            allowed_kinds = {"array_partition"}
+            anchor_cat = 2
         else:
-            label_to_anchor[lid] = (anchor_nid, anchor_cat)
+            continue
 
-        # Different labels mapping to the same anchor cannot be represented
-        # with the current per-node X_llm_labelid format
-        if anchor_nid in anchor_to_label:
-            prev_lid = anchor_to_label[anchor_nid]
-            if prev_lid != lid:
-                raise RuntimeError(
-                    f"Anchor node {anchor_nid} corresponds to multiple placeholders "
-                    f"(L{prev_lid} and L{lid}). With the current per-node tensors "
-                    f"you cannot get one memory token per placeholder in this case."
-                )
-        else:
-            anchor_to_label[anchor_nid] = lid
+        neighbor_pragmas = data_py.find_attached_pragmas(
+            g, node, allowed_kinds=allowed_kinds
+        )
+        if not neighbor_pragmas:
+            continue
 
-    # Fill output tensors
+        # Collect all labels attached to this scope anchor through its pragma neighbors
+        lids = set()
+        for _, pid in sorted(neighbor_pragmas.items()):
+            ft = str(g.nodes[pid].get("full_text", ""))
+            lids.update(_extract_label_ids_from_full_text(ft))
+
+        if not lids:
+            continue
+
+        # Current memory format supports exactly one source label per anchor node.
+        if len(lids) != 1:
+            raise RuntimeError(
+                f"Scope anchor node {node} maps to multiple labels: {sorted(lids)}. "
+                "Current X_llm_labelid format requires one Lk per anchor node."
+            )
+
+        lid = next(iter(lids))
+        anchor_nid = int(node)
+
+        prev = label_to_anchor.get(lid)
+        if prev is not None and prev != (anchor_nid, anchor_cat):
+            raise RuntimeError(
+                f"Placeholder L{lid} maps to multiple anchors: "
+                f"{prev} and {(anchor_nid, anchor_cat)}"
+            )
+        label_to_anchor[lid] = (anchor_nid, anchor_cat)
+
+        prev_lid = anchor_to_label.get(anchor_nid)
+        if prev_lid is not None and prev_lid != lid:
+            raise RuntimeError(
+                f"Anchor node {anchor_nid} corresponds to multiple labels: "
+                f"L{prev_lid} and L{lid}"
+            )
+        anchor_to_label[anchor_nid] = lid
+
     for lid, (anchor_nid, anchor_cat) in label_to_anchor.items():
         scopeids[anchor_nid] = 1
         scopecat[anchor_nid] = anchor_cat
@@ -394,7 +327,6 @@ def _build_llm_scope_tensors(g: nx.Graph) -> Dict[str, torch.Tensor]:
         "X_llm_scopecat": scopecat,
         "X_llm_labelid": label_ids,
     }
-
 
 
 def gexf_to_pt(gexf_path: str, point_json: str, out_pt: str, key_name: str,
@@ -432,7 +364,6 @@ def gexf_to_pt(gexf_path: str, point_json: str, out_pt: str, key_name: str,
     edge_index = create_edge_index_dataset_compatible(g)
 
     # These follow dataset behavior (even if edge_index is built from a relabeled copy)
-    edge_id_to_idx = data_py.build_edge_id_to_idx(g)
     edge_dict = data_py._encode_edge_dict(g, ftypes=None, ptypes=None)
 
     # Encode node features exactly like dataset
@@ -472,15 +403,22 @@ def gexf_to_pt(gexf_path: str, point_json: str, out_pt: str, key_name: str,
         edge_index=edge_index,
         edge_attr=edge_attr,
         kernel=gname,
+
         X_contextnids=xy_dict["X_contextnids"],
         X_pragmanids=xy_dict["X_pragmanids"],
         X_pragmascopenids=xy_dict["X_pragmascopenids"],
         X_pseudonids=xy_dict["X_pseudonids"],
+        X_arrayscopenids=xy_dict["X_arrayscopenids"],
+        X_pipeline_scopeids=xy_dict["X_pipeline_scopeids"],
+        X_unroll_scopeids=xy_dict["X_unroll_scopeids"],
+        X_array_partition_scopeids=xy_dict["X_array_partition_scopeids"],
+        X_scopenids=xy_dict["X_scopenids"],
         X_icmpnids=xy_dict["X_icmpnids"],
+
         X_pragma_per_node=xy_dict["X_pragma_per_node"],
         pragmas=xy_dict["pragmas"],
         perf=xy_dict["perf"],
-        edge_id_to_idx=edge_id_to_idx,
+
         X_llm_scopeids=llm_scope["X_llm_scopeids"],
         X_llm_scopecat=llm_scope["X_llm_scopecat"],
         X_llm_labelid=llm_scope["X_llm_labelid"],

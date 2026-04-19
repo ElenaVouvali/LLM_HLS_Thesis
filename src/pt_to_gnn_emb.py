@@ -3,9 +3,7 @@
 #-----------------------------------------------------------
 
 import torch
-from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch, Data
-import torch.nn.functional as F
 
 from config import FLAGS
 from model import Net
@@ -30,104 +28,115 @@ def load_and_clean_graph(path):
     return g
 
 
-
-#-----------------------------------------------------------
-#               .pt points to graph embeddings
-#-----------------------------------------------------------
-
-def extract_single_embedding(pt_point_path, checkpoint_path, device=FLAGS.device):
-    """
-    pt_point: a ProGraML graph from my dataset
-    checkpoint_path: path to trained GNN state_dict (.pth)
-    returns: Tensor [d] of frozen embedding (order matches dataset indexing)
-    """
-
-    pt_point = load_and_clean_graph(pt_point_path)
-
-    num_features = pt_point.x.size(-1)
-    edge_dim = pt_point.edge_attr.size(-1) if getattr(pt_point, "edge_attr", None) is not None else 0
-
-    assert num_features == FLAGS.num_features, f"Feature dim mismatch: {num_features} vs {FLAGS.num_features}"
-    assert edge_dim == FLAGS.edge_dim, f"Edge dim mismatch: {edge_dim} vs {FLAGS.edge_dim}"
+def load_frozen_gnn(checkpoint_path, sample_graph, device=FLAGS.device):
+    num_features = sample_graph.x.size(-1)
+    edge_dim = sample_graph.edge_attr.size(-1) if getattr(sample_graph, "edge_attr", None) is not None else 0
 
     model = Net(num_features, edge_dim=edge_dim, init_pragma_dict=None).to(device)
     state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state)
 
-    # freeze + eval
     for p in model.parameters():
         p.requires_grad = False
     model.eval()
+    return model
 
-    batch = Batch.from_data_list([pt_point]).to(device) # Batch with 1 graph
-    with torch.no_grad():
-        out = model.forward_embed(batch)   # shape: [batch_size, d]
-    
-    emb=out.cpu().squeeze(0) 
 
-#    target_indices = ((batch.X_pragmascopenids == 1) | (batch.X_llm_scopeids ==1)).nonzero(as_tuple=True)[0]
-#    print(f"Found {len(target_indices)} scope nodes")
+def disable_pragma_conditioning(data):
+    for name in (
+        "X_pragmascopenids",
+        "X_pipeline_scopeids",
+        "X_unroll_scopeids",
+        "X_array_partition_scopeids",
+    ):
+        if hasattr(data, name):
+            setattr(data, name, torch.zeros_like(getattr(data, name)))
 
-#    data = batch
-#    P = data.X_pragma_per_node.detach().clone().to(FLAGS.device)
-#    P.requires_grad_(True)
+    if hasattr(data, "X_pragma_per_node"):
+        data.X_pragma_per_node = torch.zeros_like(data.X_pragma_per_node)
+    if hasattr(data, "pragmas"):
+        data.pragmas = torch.zeros_like(data.pragmas)
 
-    # Plug it back into the data object
-#    data.X_pragma_per_node = P
+    return data
 
-    # Forward (use the real forward that produces perf/area)
-#    out_dict, total_loss, loss_dict, gae_loss = model(data)
-#    perf_hat = out_dict["perf"].mean()
-#    area_hat = out_dict["area"].mean()
 
-    # Scalarize
-#    lam = 0.5
-#    J = lam * perf_hat + (1 - lam) * area_hat
+#-----------------------------------------------------------
+#               .pt points to graph embeddings
+#-----------------------------------------------------------
 
-    # Backprop into P
-#    model.zero_grad(set_to_none=True)
-#    if P.grad is not None: P.grad.zero_()
-#    J.backward()
+@torch.no_grad()
+def extract_single_embedding(
+    pt_point_path,
+    checkpoint_path,
+    device=FLAGS.device,
+    disable_pragma_injection=True,
+):
+    pt_point = load_and_clean_graph(pt_point_path)
+    model = load_frozen_gnn(checkpoint_path, pt_point, device=device)
 
-#    print("dJ/dP shape:", P.grad.shape)      # [N_nodes, 5]
+    batch = Batch.from_data_list([pt_point]).to(device)
+    if disable_pragma_injection:
+        batch = disable_pragma_conditioning(batch)
 
-#    for idx in target_indices:
-#        node_idx = idx.item()
-#        print(f"Node {node_idx} | P: {P[node_idx].detach()} | Grad: {P.grad[node_idx]}")
-#        print(f" Node embedding after MLP : {emb[node_idx]}")
+    emb = model.forward_embed(batch).detach().cpu().squeeze(0)
+    emb = torch.nan_to_num(emb, nan=0.0, posinf=0.0, neginf=0.0)
+    return emb
 
-    return emb  # shape : [d]
 
-#    print(f"num of layers returned = {len(outs)}")
-#    for li, h in enumerate(outs):
-        # h: [N, D] where N = num nodes in the (batched) graph
-#        h_cpu = h.detach().cpu()
-#        print(f"layer {li}: shape={tuple(h_cpu.shape)}")
-#        print(f"L9 scope pseudo node : {h_cpu[236, :].tolist()}")
-#        nrm = h_cpu[li].norm().item()
-#        print(li, "||h|| =", nrm)
-#        print("\n")
+@torch.no_grad()
+def extract_slot_aligned_memory(
+    pt_point_path,
+    checkpoint_path,
+    max_slots=64,
+    device=FLAGS.device,
+    disable_pragma_injection=True,
+):
+    pt_point = load_and_clean_graph(pt_point_path)
+    model = load_frozen_gnn(checkpoint_path, pt_point, device=device)
 
-#    hs = [o[417].detach().cpu() for o in outs]
-#    for l in range(1, len(hs)):
-#        delta = (hs[l] - hs[l-1]).norm().item()
-#        cos = F.cosine_similarity(hs[l].unsqueeze(0), hs[l-1].unsqueeze(0)).item()
-#        print(f"{l-1}->{l}: Δ={delta:.4f}, cos={cos:.4f}")
+    batch = Batch.from_data_list([pt_point]).to(device)
+    if disable_pragma_injection:
+        batch = disable_pragma_conditioning(batch)
 
-#    with torch.no_grad():
-#        outs, attn = model.forward_node_embed_with_attn(batch, capture="all")
-#    for rec in attn:
-#        ei = rec["edge_index"]   # [2, E']
-#        alpha = rec["alpha"]     # [E', heads] or [E']
-        # pick edges INTO nid
-#        mask = (ei[1] == 417)
-#        a = alpha[mask]
-#        src = ei[0][mask]
-        # average heads if needed
-#        if a.dim() == 2:
-#            a = a.mean(dim=1)
-#        top = torch.topk(a, k=min(10, a.numel()))
-#        print(rec["layer"], "top influencers src nodes:", src[top.indices].tolist(), "weights:", top.values.tolist())
+    graph_embed = model.forward_embed(batch)
+    node_emb = model.forward_node_embed(batch)
+
+    scope = batch.X_llm_scopeids.bool()
+    label = batch.X_llm_labelid.long()
+    scopecat = batch.X_llm_scopecat.long()
+
+    sel = scope & (label > 0) & (label <= max_slots)
+    sel_idx = sel.nonzero(as_tuple=False).view(-1)
+
+    node_embs = torch.zeros((max_slots, node_emb.size(-1)), dtype=node_emb.dtype, device=node_emb.device)
+    node_embs_mask = torch.zeros((max_slots,), dtype=torch.bool, device=node_emb.device)
+    slot_cats = torch.zeros((max_slots,), dtype=torch.long, device=node_emb.device)
+
+    node_ids = [-1] * max_slots
+    labels = [-1] * max_slots
+
+    for ni in sel_idx.tolist():
+        lid = int(label[ni].item())
+        slot = lid - 1
+        node_embs[slot] = node_emb[ni]
+        node_embs_mask[slot] = True
+        slot_cats[slot] = int(scopecat[ni].item())
+        node_ids[slot] = ni
+        labels[slot] = lid
+
+    node_embs = torch.nan_to_num(node_embs.detach().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    graph_embed = torch.nan_to_num(graph_embed.detach().cpu(), nan=0.0, posinf=0.0, neginf=0.0)
+    node_embs_mask = node_embs_mask.detach().cpu()
+    slot_cats = slot_cats.detach().cpu()
+
+    return {
+        "node_embs": node_embs,
+        "node_embs_mask": node_embs_mask,
+        "graph_embed": graph_embed,
+        "slot_cats": slot_cats,
+        "node_ids": node_ids,
+        "labels": labels,
+    }
 
 
 #-----------------------------------------------------------
